@@ -85,7 +85,6 @@ IF(BUILD_OPENWRT_MAKEFILE_STANDALONE)
       PATTERN "doc" EXCLUDE
       PATTERN "cpack" EXCLUDE
       PATTERN ".git" EXCLUDE
-      PATTERN ".github" EXCLUDE
       PATTERN ".vscode" EXCLUDE
       PATTERN ".devcontainer" EXCLUDE
       PATTERN "configure-*.cmake" EXCLUDE

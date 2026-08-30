@@ -20,6 +20,10 @@ commands). Read it for user-facing behaviour; it is not a build or architecture 
 
 ## 1. Build & verify loop
 
+**There is no CI in this fork.** The upstream `.github/` tree (GitHub Actions workflows, composite
+actions, dependabot) has been deleted deliberately — do not re-add it or any other CI integration.
+Everything below runs locally; building, testing and formatting are all verified by hand.
+
 ### Two things will bite on the first attempt
 
 **(a) `cmake --preset` fails because there are no git tags.**
@@ -42,7 +46,7 @@ mislabelled without any warning. It only affects packaging metadata (see §4).
 
 ### The blessed sequence
 
-Mirrors `.github/workflows/build.yml`. Run from the repo root.
+The reproducible-build sequence. Run from the repo root.
 
 ```sh
 ./get-source-date-epoch.sh > .env                      # fails on a dirty tree unless PRESET is set
@@ -123,9 +127,9 @@ CMake or ctest. `test/asterisk/AST_BUILDOPT_SUM.c` *is* used, by `ShowAstBuildOp
 
 ### Formatting
 
-`clang-format` **18 exactly** (`ClangFormatFindAndCheck(18)` at `CMakeLists.txt:97`; CI enforces it
-over `src` via `jidicula/clang-format-action`). If it is missing, CMake only warns and skips the
-formatting targets — CI will still reject unformatted code.
+`clang-format` **18 exactly** (`ClangFormatFindAndCheck(18)` at `CMakeLists.txt:97`). If it is
+missing, CMake only warns and skips the formatting targets, so formatting silently goes unchecked —
+run the check target yourself before committing.
 
 ```sh
 cmake -P format-chan-quectel.cmake                 # or: cmake --build build --target asterisk-chan-quectel-code-formatter
@@ -307,12 +311,8 @@ dropping `ast_channel_macrocontext()`; `chan_console.c`'s diff is comment-only. 
 - `ASTERISK_VERSION_NUM` currently affects only packaging: deb dependency `asterisk16` vs
   `asterisk` (`CMakeLists.txt:323`) and the OpenWRT package name plus `AST_HEADER_DIR`
   (`openwrt/CMakeLists.txt:18`).
-- No version pin anywhere exceeds `200300`. The docker Taskfiles (`docker/*/*/Taskfile.dist.yaml`)
-  top out at `200100`, and `.github/workflows/build-owrt.yml` at `200300`. There is no 21 or 22
-  entry.
-- `.github/actions/install-asterisk-headers/configure-asterisk.sh:106-111` passes
-  `--disable chan_sip --disable chan_skinny --disable chan_mgcp` — all removed in 22, so
-  menuselect will error if that action is pointed at 22.
+- No version pin anywhere exceeds `200100`: the docker Taskfiles (`docker/*/*/Taskfile.dist.yaml`)
+  top out there. There is no 21 or 22 entry.
 - The `asterisk-22` branch exists but is empty (identical to `master` bar a `.gitignore` line).
 - `README.md:19` still states the minimum is Asterisk 16 and gives no upper bound.
 
