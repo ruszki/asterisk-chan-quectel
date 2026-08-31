@@ -1227,10 +1227,13 @@ sudo systemctl enable --now asterisk
 ```
 
 Nothing in Asterisk's build system installs this file — `contrib/systemd/` is referenced by no
-Makefile target — so the copy is mandatory. The shipped unit hardcodes `/usr/sbin/asterisk` while
-the script configures `--sbindir=/usr/bin`; on trixie `/usr/sbin` is merged into `/usr/bin` so both
-resolve, but the `sed` above makes it explicit rather than depending on that. `RuntimeDirectory`
-ships commented out, and without it `/var/run/asterisk` does not exist on a tmpfs `/run`.
+Makefile target — so the copy is mandatory. The shipped unit hardcodes `/usr/sbin/asterisk`
+(`contrib/systemd/asterisk.service:16-17`) while the script configures `--sbindir=/usr/bin`, and
+trixie does **not** merge `/usr/sbin` into `/usr/bin` — `readlink -f /usr/sbin` in step 7 prints
+`/usr/sbin`, so the two are different directories and `/usr/sbin/asterisk` does not exist. The
+`sed` above is therefore load-bearing, not cosmetic: without it `systemctl start` fails with
+`status=203/EXEC`. `RuntimeDirectory` ships commented out, and without it `/var/run/asterisk`
+does not exist on a tmpfs `/run`.
 
 #### 10. Verify the daemon
 
