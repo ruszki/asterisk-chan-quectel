@@ -1,6 +1,8 @@
 /*
    Copyright (C) 2010 bg <bg_one@mail.ru>
 */
+#include "ast_config.h"
+
 #include <asterisk/callerid.h> /* ast_parse_caller_presentation() */
 
 #include "dc_config.h"

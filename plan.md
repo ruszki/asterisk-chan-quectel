@@ -1301,8 +1301,27 @@ ctest --test-dir build
   `cmake/test/needed-libs.cmake`, not a porting problem.
 - **X6, the real point of building here:** GCC 14 promotes `-Wimplicit-function-declaration`,
   `-Wincompatible-pointer-types`, `-Wint-conversion` and `-Wreturn-mismatch` to errors. Skim the
-  log — `grep -E 'warning|error' /tmp/chan-quectel-build.log`. The only expected warning is the
-  pre-existing `src/memmem.c:55: -Wdiscarded-qualifiers`.
+  log — `grep -E 'warning|error' /tmp/chan-quectel-build.log`. **None of those four may appear.**
+  What does appear is one benign warning, plus one that is toolchain-dependent:
+
+  | Warning | Source | Verdict |
+  | --- | --- | --- |
+  | `alsa/global.h:30: #warning "use #include <alsa/asoundlib.h>…" [-Wcpp]` | `src/cli.c:11` includes `<alsa/global.h>` directly for the version macros; alsa-lib nags by design | expected, cosmetic, unrelated to Asterisk |
+  | `memmem.c:55: -Wdiscarded-qualifiers` | `return memchr(l, (int)*cs, l_len);` | **may or may not appear.** GCC 15 emits it, trixie's GCC 14 does not. `memmem.c` is compiled either way — its `#ifndef HAVE_MEMMEM` guard is line 1, before anything includes `config.h`, so the fallback is never actually compiled out |
+
+  Note that `grep -E 'warning|error'` also matches the *filename* in
+  `[ 72%] Building C object …/error.c.o`. That is not an error.
+
+  Historical: this step also used to emit four ``‘struct ast_frame’/‘struct ast_str’ declared
+  inside parameter list`` warnings from `asterisk/codec.h` and `asterisk/format.h`. Cause was
+  `src/dc_config.c:4` opening with `<asterisk/callerid.h>` instead of `"ast_config.h"` — the only
+  `.c` in `src/` that pulled an Asterisk header before `ast_config.h`, so `callerid.h:48 →
+  format.h:26 → codec.h` was reached before `<asterisk.h>` had declared either tag. Inert (nothing
+  in `src/` calls `ast_codec_samples_count()` or `ast_format_generate_sdp_fmtp()`) and **not** an
+  Asterisk-22 regression — `format.h` is byte-identical between 20.21.0 and 22.11.0, and the two
+  `codec.h` prototypes sit at `:68` and `:188` in 20 against `:68` and `:190` in 22, the offset
+  being the added `quality` field. Fixed by putting `"ast_config.h"` first in `dc_config.c`; if
+  the warnings reappear, that include order has regressed.
 
 ```sh
 readelf -hW build/src/chan_quectel.so | grep -E 'Machine|Type'   # AArch64, DYN

@@ -398,7 +398,9 @@ dropping `ast_channel_macrocontext()`; `chan_console.c`'s diff is comment-only. 
   (`openwrt/CMakeLists.txt:18`).
 - No version pin anywhere exceeds `200100`: the docker Taskfiles (`docker/*/*/Taskfile.dist.yaml`)
   top out there. There is no 21 or 22 entry.
-- The `asterisk-22` branch carries no `src/` changes — only `plan.md`, `.claude/`,
+- The `asterisk-22` branch's only `src/` change is the include-order fix in `src/dc_config.c`
+  (`"ast_config.h"` first, silencing four benign `struct ast_frame`/`struct ast_str`
+  parameter-list warnings from `codec.h`/`format.h`); otherwise just `plan.md`, `.claude/`,
   `tools/configure-asterisk-22.sh` and the CI deletion. **`plan.md` at the repo root is the
   migration plan**: Part A the blocker inventory, Part B the ordered action list, Part C the
   Phase 0 record, Part D the reference-tree re-baseline, Part E the Phase 1 record and the
