@@ -9,9 +9,17 @@ older (`README.md` still says "minimal supported Asterisk version is 16").
 Reference Asterisk sources are available on this machine and should be consulted rather than
 guessed at:
 
-* pristine Asterisk 20 source tree (unconfigured — no `buildopts.h`)
-* pristine Asterisk 22 source tree (unconfigured)
-* **installed Asterisk 22 headers** — this is what the build actually compiles against by default |
+* Asterisk **20.21.0** source tree — an unmodified official release tarball, unconfigured
+* Asterisk **22.11.0** source tree — likewise
+
+Both are pinned releases, byte-identical to `asterisk-NN.M.P.tar.gz` as published upstream. That
+identity is the point: it is what makes `diff` against them a trustworthy answer to an API
+question, so **never run `./configure` or `make` inside them** — configure a copy instead
+(`tools/configure-asterisk-22.sh`). Being pinned, they can lag upstream's `20` / `22` dev branches.
+
+**There are no installed Asterisk headers on this machine** — no `/usr/include/asterisk`, no
+`asterisk.pc`, no `asterisk` daemon. This matches the Raspberry Pi target, where Debian 13 ships
+no `asterisk` package at all. The source tree is the only header source; see §1.
 
 `README.md` is a changes-relative-to-upstream document (dialplan surface, config options, CLI
 commands). Read it for user-facing behaviour; it is not a build or architecture doc.
@@ -37,12 +45,32 @@ git describe --abbrev=6 --dirty --match "v*" --long --tags   # check first
 git tag v2026.08.30                                          # only if the above fails
 ```
 
-**(b) `ASTERISK_VERSION_NUM` silently defaults to `180000`.**
-`cmake/asterisk-version-num.cmake` resolves it as: cached cache-var → `pkg-config asterisk
-version_number` → hardcoded `180000`. There is **no `asterisk.pc` installed here**, so it lands on
-the default even though `/usr/include` holds Asterisk 22 headers. Always pass it explicitly:
-`220000`. Note it is never derived from the headers being compiled against, so a build can be
-mislabelled without any warning. It only affects packaging metadata (see §4).
+**(b) There are no Asterisk headers to find, and `ASTERISK_VERSION_NUM` silently defaults to
+`180000`.** Configure now dies first on the headers:
+
+```
+-- Looking for asterisk.h - not found
+CMake Error at CMakeLists.txt:210 (MESSAGE):
+  Asterisk header not found.
+```
+
+Pointing `AST_HEADER_DIR` at an *unconfigured* reference tree fails at the **same** line, because
+`asterisk.h:21` includes the not-yet-generated `asterisk/autoconfig.h`; only
+`build/CMakeFiles/CMakeConfigureLog.yaml` says so. Fix by configuring a copy of the tree first —
+see "Finding the Asterisk headers" below.
+
+Past that, `cmake/asterisk-version-num.cmake` resolves the version as: cached cache-var →
+`pkg-config asterisk version_number` → hardcoded `180000`. There is **no `asterisk.pc` installed
+here**, so it lands on the default. Always pass it explicitly: `220000`. It is never derived from
+the headers being compiled against, so a build can be mislabelled without any warning. It only
+affects packaging metadata (see §4).
+
+**(c) Nothing configures without a *configured* Asterisk tree.** Do this once, before anything
+else; it prints the `AST_HEADER_DIR` to use (see `CLAUDE.local.md` for the paths on this machine):
+
+```sh
+AST_INC=$(tools/configure-asterisk-22.sh <asterisk-22-tree>)   # configures <tree>-configured
+```
 
 ### The blessed sequence
 
@@ -59,9 +87,14 @@ ctest --preset deb
 Quick local variant, no reproducible-build wrapper:
 
 ```sh
-cmake -P make-build-dir.cmake default 220000
+cmake -S . -B build -DASTERISK_VERSION_NUM=220000 -DAST_HEADER_DIR="$AST_INC"
 cmake -P build-chan-quectel.cmake default
 ```
+
+`make-build-dir.cmake` passes no `AST_HEADER_DIR`, so use the plain `cmake -S/-B` form above until
+a preset seeds it. **`jq`, `ninja`, `lintian` and `clang-format` are not installed on this dev
+box**, so the `deb`/`rpi` preset path (`get-build-flags.sh` needs `jq`) and the packaging and
+formatting targets only run on the Pi.
 
 Other `#!/usr/bin/cmake -P` driver scripts at the root: `install-chan-quectel.cmake [arm|arm64]`,
 `make-package.cmake [arm|arm64]`, `format-chan-quectel.cmake`, `make-release-tag.cmake`,
@@ -84,12 +117,26 @@ Other `#!/usr/bin/cmake -P` driver scripts at the root: `install-chan-quectel.cm
 - a **directory** containing `asterisk.h` + `asterisk/` — pass it as `-DAST_HEADER_DIR=…`;
 - an **`asterisk-headers.tar[.gz]` archive**, which is extracted into `build/include`. If
   `AST_HEADER_DIR` is unset, the source root is scanned for such an archive; otherwise system
-  includes are used. Build one with `./asterisk-headers.sh [dir]` (defaults to `/usr/include`).
+  includes are used — and there are none here. Build one with `./asterisk-headers.sh <dir>`; its
+  `/usr/include` default no longer resolves, so the argument is now mandatory, and `<dir>` must be
+  a **configured** tree's `include/` or the archive reproduces the failure below.
 
-Note the reference trees for Asterisk 20 and 22 are **unconfigured** — they have no
-`asterisk/buildopts.h`, so `CMakeLists.txt:214` (`FIND_PATH(… NAMES buildopts.h … REQUIRED)`) will
-fail if you point `AST_HEADER_DIR` at one directly. They are for reading and diffing, not building.
-To build against a specific tree, `./configure && make install-headers` it first.
+Either way the directory must be *configured*. The reference trees for Asterisk 20 and 22 are
+**not** — they have no `asterisk/autoconfig.h` and no `asterisk/buildopts.h` — so pointing
+`AST_HEADER_DIR` at one directly fails at `CMakeLists.txt:208-211` with `Asterisk header not
+found.` (the `FIND_PATH(… NAMES buildopts.h … REQUIRED)` at `:214` is never reached). They are for
+reading and diffing, not building.
+
+To get headers, configure a **copy**, never the reference tree itself:
+
+```sh
+tools/configure-asterisk-22.sh <src-tree> [<dest-tree>]   # dest defaults to <src-tree>-configured
+```
+
+It refuses a tree whose `.version` is not `22.*`, runs `./configure` with the module list corrected
+for 22, then `make include/asterisk/buildopts.h`, and prints `<dest-tree>/include`. Build the
+daemon from that same copy on the Pi so its `AST_BUILDOPT_SUM` matches the module's by
+construction.
 
 ### Build options
 
@@ -109,7 +156,9 @@ Root `CMakeLists.txt:123-139`. Defaults in bold.
 | `CHECK_SOURCE_DATE_EPOCH` (**OFF**) | reproducible-build check target |
 
 Dependencies: Threads, ALSA ≥ 1.1.2, SQLite3 ≥ 3.6.5, Iconv, plus Asterisk headers. On Debian:
-`libasound2-dev libsqlite3-dev asterisk-dev build-essential dpkg-dev jq`.
+`libasound2-dev libsqlite3-dev build-essential dpkg-dev jq`. There is **no `asterisk-dev` package
+to install** — Debian 13 ships no `asterisk` at all, and it is uninstalled on this dev box — so the
+headers always come from a configured Asterisk source tree (see above).
 Compiled with `-Wall`, `_GNU_SOURCE`, `HAVE_CONFIG_H`,
 `AST_MODULE_SELF_SYM=__internal_chan_quectel_self`, PIC, hidden visibility.
 
@@ -199,6 +248,10 @@ buffers, paced by an `ast_timer`. **UAC mode** uses ALSA capture/playback (`src/
 `slin16=yes` on SimCOM, else `slin`. `mixbuffer.c` only multiplexes when `multiparty` is on
 (it is off by default, and multiparty calls are actively rejected).
 
+The multiparty branch at `channel.c:661-681` calls `ast_frame_adjust_volume()` with a **positive**
+stream count where its comment intends a division — a known latent bug, deliberately left alone
+because `multiparty` is off; see the `ast_frame_adjust_volume()` rule in §3 and `plan.md` §D.5.
+
 ### SMS
 
 Inbound: `+CMT` / `+CMTI` / `+CMGR` / `+CMGL` / `+CDS` / `+CDSI` → `at_parse.c` → `pdu.c` TPDU parse
@@ -262,6 +315,12 @@ diffing all 28 Asterisk headers included from `src/`, and by checking every `ast
 `src/` against the Asterisk 22 headers. Do not assume a porting problem exists before reproducing
 it.
 
+The comparison below was re-run against the pinned releases **20.21.0** and **22.11.0** and is
+unchanged. Those releases lag upstream's `20` / `22` dev branches, but across the whole `include/`
+tree the dev branches differ from them in only two files, neither of which changes behaviour: a
+`frame.h` doc-comment correction (see the `ast_frame_adjust_volume()` rule below) and an added
+`ast_taskprocessor_is_executing()` in `taskprocessor.h`.
+
 Of the headers this driver includes, only these differ at all, and none of the differences touch
 an API used here:
 
@@ -288,7 +347,14 @@ dropping `ast_channel_macrocontext()`; `chan_console.c`'s diff is comment-only. 
 ### Rules when working on version compatibility
 
 - **Verify against the trees, not from memory.** `diff -u ${PATH_TO_ASTERISK_20_SOURCE}/include/asterisk/X.h
-  ${PATH_TO_ASTERISK_22_SOURCE}/include/asterisk/X.h` before claiming an API changed.
+  ${PATH_TO_ASTERISK_22_SOURCE}/include/asterisk/X.h` before claiming an API changed. Both trees are
+  pinned release tarballs, so this only answers the question for those releases — check upstream's
+  branch if something looks newer than the pin.
+- **`ast_frame_adjust_volume(f, adjustment)` takes a linear gain factor, not dB.** A positive
+  `adjustment` multiplies each sample by its magnitude, a negative one divides, `0` is a no-op
+  (`main/frame.c`, identical in 20 and 22); `10^(dB/20)` converts. Asterisk's own header said "the
+  number of dB" until a post-22.11.0 doc fix. `src/channel.c:677` gets this backwards in the
+  `multiparty` path — known, unfixed, recorded in `plan.md` §D.5; do not "fix" it as a drive-by.
 - **Do not introduce the removed-in-22 APIs**: anything `*_macro*`, `ast_channel_monitor*`,
   `asterisk/monitor.h`.
 - **Avoid adding `#if ASTERISK_VERSION_NUM` guards.** There are currently none in `src/`, by
@@ -313,7 +379,10 @@ dropping `ast_channel_macrocontext()`; `chan_console.c`'s diff is comment-only. 
   (`openwrt/CMakeLists.txt:18`).
 - No version pin anywhere exceeds `200100`: the docker Taskfiles (`docker/*/*/Taskfile.dist.yaml`)
   top out there. There is no 21 or 22 entry.
-- The `asterisk-22` branch exists but is empty (identical to `master` bar a `.gitignore` line).
+- The `asterisk-22` branch carries no `src/` changes yet — only `plan.md`, `.claude/`,
+  `tools/configure-asterisk-22.sh` and the CI deletion. **`plan.md` at the repo root is the
+  migration plan**: Part A the blocker inventory, Part B the ordered action list, Part C the
+  Phase 0 record, Part D the reference-tree re-baseline. Read it before starting version work.
 - `README.md:19` still states the minimum is Asterisk 16 and gives no upper bound.
 
 ---
