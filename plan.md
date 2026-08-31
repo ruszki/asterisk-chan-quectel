@@ -200,6 +200,288 @@ tree in place so it yields usable headers; full scope (build, packaging, docker,
 
 ---
 
+## Part C — Phase 0 implementation record
+
+Executed 2026-08-31. Phase 0 closes exactly one blocker — **B1** — and provisions the Raspberry
+Pi. Nothing under `src/`, `cmake/`, `docker/` or `openwrt/` was touched, and neither Asterisk
+tree was configured; those are Phases 1–6.
+
+### C.1 — Done in the repository
+
+**Release tag created** (Phase 0, step 1). Run from the repo root on branch `asterisk-22` with a
+clean working tree — the script refuses a dirty one (`make-release-tag.cmake:13-15`):
+
+```sh
+cmake -P make-release-tag.cmake
+# -- Package version: v2026.08.30
+```
+
+The name is derived by the script from the **committer timestamp of `HEAD`**, not from the
+current date: `git log -n 1 --pretty=format:%H;%ct` → `1788132933` →
+`date --utc --date=@1788132933 +v%Y.%m.%d` → `v2026.08.30`.
+
+The result is an **annotated** tag (`git tag -a -m "Package version"`), which is what
+`git describe --tags` needs in order to emit the `-N-g<sha>` suffix the version regex expects:
+
+```
+$ git cat-file -t v2026.08.30
+tag
+$ git cat-file -p v2026.08.30
+object 5d30d81dd3d11953ef4f7f076058ff810dc61898
+type commit
+tag v2026.08.30
+tagger Gergo Vladiszavlyev <github@ruszki.com> 1788153456 +0000
+
+Package version
+```
+
+Pushed to `origin`, so the Pi only needs `git fetch --tags`:
+
+```
+$ git push origin v2026.08.30
+ * [new tag]         v2026.08.30 -> v2026.08.30
+$ git ls-remote --tags origin v2026.08.30
+cbeda540cb66a5e2d50a420687e7b44012679864	refs/tags/v2026.08.30
+```
+
+**Evidence B1 is closed.** Before:
+
+```
+$ git describe --abbrev=6 --dirty --match "v*" --long --tags
+fatal: No names found, cannot describe anything.
+```
+
+After — and a full configure now runs to completion instead of aborting at `CMakeLists.txt:68`:
+
+```
+$ git describe --abbrev=6 --dirty --match "v*" --long --tags
+v2026.08.30-0-g5d30d8
+
+$ cmake -S . -B <throwaway-dir> -DASTERISK_VERSION_NUM=220000
+-- Looking for clang-format executable - not found
+-- Project version: 2026.8.30
+-- Asterisk version: 220000 [cached]
+-- Asterisk header directory: /usr/include/
+-- Getting AST_BUILDOPT_SUM - 1fb7f5c06d7a2052e38d021b3d8ca151
+-- Found ALSA: /usr/lib/x86_64-linux-gnu/libasound.so (1.2.15.3)
+-- Found SQLite3: /usr/lib/x86_64-linux-gnu/libsqlite3.so (3.46.1)
+CMake Warning at src/CMakeLists.txt:126 (MESSAGE):
+  Cannot create formatting targets - clang-format not found
+-- Configuring done (3.7s)
+```
+
+Three lines in that log are worth recording; **none of them is fixed by Phase 0**:
+
+- `Asterisk header directory: /usr/include/` — the dev box silently fell back to the
+  **Debian-patched** headers, precisely the hazard described in Context §2. The reported
+  `AST_BUILDOPT_SUM` `1fb7f5c06d7a2052e38d021b3d8ca151` therefore belongs to Debian's
+  asterisk-dev 22.5.2, **not** to 22.11.0, and is meaningless for the Pi. **B2** is what makes
+  the source tree usable instead.
+- `Asterisk version: 220000 [cached]` — only because it was passed on the command line. Drop the
+  flag and `180000` is still assumed with no warning (**B3**).
+- `clang-format not found` — this dev box has none at all; on the Pi it *will* be found, but
+  rejected as version 19 (**B6**).
+
+**The tag going stale is expected.** Once the commit carrying this chapter lands, `git describe`
+returns `v2026.08.30-1-g<sha>`. The regex at `CMakeLists.txt:59` still matches, with
+`CHAN_VER_TWEAK` = `1` and `CHAN_STATUS` = `-g<sha>`, so B1 stays closed. Re-run
+`cmake -P make-release-tag.cmake` only when cutting an actual release.
+
+### C.2 — Raspberry Pi command list (Phase 0, step 2)
+
+Everything below runs **on the Pi**, as the normal login user (member of `sudo`). Assumes a
+fresh 64-bit Raspberry Pi OS (trixie) with network access and **≥ 5 GB free on `/`**.
+
+Run the blocks in order and check the expected output before moving on.
+
+#### 0. Sanity check the machine
+
+```sh
+uname -m
+. /etc/os-release; echo "$ID $VERSION_ID $VERSION_CODENAME"
+nproc
+free -m
+df -h /
+```
+
+Expect `aarch64` and `debian 13 trixie`. **If `uname -m` says `armv7l` or `armhf`, stop** — this
+is a 32-bit userland and the whole plan targets aarch64.
+
+#### 1. Base packages
+
+```sh
+sudo apt update
+sudo apt full-upgrade -y
+sudo apt install -y \
+    build-essential cmake ninja-build git jq dpkg-dev lintian clang-format-18 \
+    libasound2-dev libsqlite3-dev pkg-config curl wget ca-certificates
+```
+
+Verify:
+
+```sh
+gcc --version | head -1
+cmake --version | head -1
+ninja --version
+jq --version
+lintian --version
+clang-format-18 --version
+dpkg-buildflags --version | head -1
+```
+
+What matters:
+
+- **`clang-format-18` must report 18.x.** `ClangFormatFindAndCheck(18)` at `CMakeLists.txt:97`
+  accepts nothing else. Trixie's unversioned `clang-format` alternative is **19** and will be
+  rejected, silently skipping the formatting targets (**B6**). Until B6 is fixed in Phase 2
+  step 9, pass `-DCLANG_FORMAT=/usr/bin/clang-format-18` on the CMake command line — it is a
+  `CACHE FILEPATH`.
+- **`lintian` must be > 2.62** (`cpack/post-build-lintian.cmake` requires it, and finds it
+  `REQUIRED`). Trixie ships 2.122.0 (**P4**).
+- **gcc is 14.2.0** on trixie. It promotes `-Wimplicit-function-declaration`,
+  `-Wincompatible-pointer-types`, `-Wint-conversion` and `-Wreturn-mismatch` to hard errors
+  (**X6**). Nothing to do now; this is verified when the driver is actually built.
+
+#### 2. Clone the driver and pick up the tag
+
+```sh
+mkdir -p ~/src
+cd ~/src
+git clone https://github.com/ruszki/asterisk-chan-quectel.git
+cd ~/src/asterisk-chan-quectel
+git checkout asterisk-22
+git fetch --tags
+git describe --abbrev=6 --dirty --match "v*" --long --tags
+```
+
+The last command **must** print something starting with `v2026.08.30-`. If it prints
+`fatal: No names found`, the tag did not come across — recreate it locally (the tree must be
+clean):
+
+```sh
+cmake -P make-release-tag.cmake     # → -- Package version: v2026.08.30
+```
+
+If you use SSH rather than HTTPS for GitHub, substitute
+`git clone git@github.com:ruszki/asterisk-chan-quectel.git`.
+
+#### 3. Fetch the Asterisk 22.11.0 source
+
+Asterisk must be built from source: **trixie ships no `asterisk` package at all** (see Context
+§1), and building the daemon and the module from one configured tree is what makes their
+`AST_BUILDOPT_SUM` agree by construction (**B4**).
+
+```sh
+cd ~/src
+wget https://downloads.asterisk.org/pub/telephony/asterisk/releases/asterisk-22.11.0.tar.gz
+echo '3bd5ee040509a3d3cd9b1ba9520c18e6ec0a7e7981ca68c457dcd36ba3c54d94  asterisk-22.11.0.tar.gz' | sha256sum -c -
+tar xzf asterisk-22.11.0.tar.gz
+mv asterisk-22.11.0 asterisk-22
+ls ~/src/asterisk-22/configure
+```
+
+`sha256sum -c -` must print `asterisk-22.11.0.tar.gz: OK`. (The checksum sidecar upstream is
+`asterisk-22.11.0.sha256` — note it is *not* named `…tar.gz.sha256`; that URL 404s. md5 is
+`077b09bd6e449f68f03da44c85b86dde`, size 26 724 408 bytes.)
+
+#### 4. Asterisk's own prerequisites
+
+Preview what will be installed first:
+
+```sh
+cd ~/src/asterisk-22
+sudo contrib/scripts/install_prereq test | head -40
+```
+
+Then install:
+
+```sh
+sudo contrib/scripts/install_prereq install
+```
+
+Expect this to take a while and pull roughly 80 `-dev` packages (1–2 GB). Two things that look
+alarming but are normal:
+
+- The script installs `aptitude` first if it is missing (`install_prereq:279-281`).
+- Several names in its Debian list no longer exist in trixie — `libneon27-dev`,
+  `libgmime-2.6-dev`, `libmysqlclient-dev`, `libsrtp0-dev`, `libc-client2007e-dev`,
+  `libresample1-dev`, `libiksemel-dev`. They are **filtered out**, not failed on:
+  `check_installed_debs()` (`install_prereq:210-217`) selects only packages `aptitude search`
+  actually knows about.
+
+Verify the libraries that matter to Asterisk 22:
+
+```sh
+pkg-config --modversion jansson libedit uuid libxml-2.0 sqlite3 openssl alsa
+```
+
+`jansson` must be **≥ 2.11**.
+
+#### 5. Optional — swap headroom
+
+Only if `free -m` in step 0 showed less than 4 GB of RAM. Building Asterisk with `-j4` on a 2 GB
+Pi will OOM otherwise (the alternative is simply `make -j2`).
+
+```sh
+sudo dphys-swapfile swapoff
+sudo sed -i 's/^CONF_SWAPSIZE=.*/CONF_SWAPSIZE=2048/' /etc/dphys-swapfile
+sudo dphys-swapfile setup
+sudo dphys-swapfile swapon
+free -m
+```
+
+#### 6. Note — offline builds only
+
+`third-party/{pjproject,jansson,libjwt}` are downloaded during Asterisk's `./configure`. With
+network on the Pi there is nothing to do here. Without it, the tarballs must be staged on
+another machine and `./configure --with-download-cache=<dir>` used in Phase 1.
+
+#### 7. Phase 0 exit check
+
+One copy-paste block. Everything must be `OK`:
+
+```sh
+cd ~/src/asterisk-chan-quectel
+git describe --abbrev=6 --dirty --match "v*" --long --tags
+for t in gcc cmake ninja git jq dpkg-buildflags lintian clang-format-18 wget; do
+    command -v "$t" >/dev/null && echo "OK      $t" || echo "MISSING $t"
+done
+test -x ~/src/asterisk-22/configure && echo "OK      asterisk-22 source" || echo "MISSING asterisk-22 source"
+pkg-config --modversion jansson
+```
+
+#### 8. Stop here
+
+Do **not** run `./configure` or `make` in `~/src/asterisk-22` yet. That is Phase 1 (steps 3–5),
+and it first needs `.version` written into the tree (**B7**) and the not-yet-written
+`tools/configure-asterisk-22.sh`, whose menuselect list must drop the modules that no longer
+exist in 22 (**X3**). Configuring the tree by hand now would produce a `buildopts.h` that Phase 1
+would have to redo.
+
+### C.3 — Status after Phase 0
+
+| Blocker | State | Closed by |
+| --- | --- | --- |
+| **B1** no git tag | **Fixed** — `v2026.08.30` created and pushed | Phase 0 |
+| B2 `buildopts.h` / `autoconfig.h` missing from the tree | open | Phase 1, steps 4–5 |
+| B3 `ASTERISK_VERSION_NUM` defaults to `180000` | open | Phase 2, step 6 |
+| B4 `AST_BUILDOPT_SUM` self-consistency only | open | Phase 1, step 5 (by construction) |
+| B5 missing `build-arm64` / `package-arm64` presets | open | Phase 3, step 12 |
+| B6 `clang-format` found only under the bare name | open (workaround: `-DCLANG_FORMAT=/usr/bin/clang-format-18`) | Phase 2, step 9 |
+| B7 Asterisk tree has no `.version` | open | Phase 1, step 3 |
+| P1–P4 packaging | open | Phase 3 |
+| P5, P6 | verified as already correct — do not "fix" | — |
+| X1, X2 docker | open | Phase 4 |
+| X3 menuselect list invalid for 22 | open | Phase 1, step 4 |
+| X4 OpenWRT | open | Phase 5 |
+| X5 README | open | Phase 6 |
+| X6 GCC 14 promoted warnings | unverified — needs a real build on the Pi | Verification, step 4 |
+
+One housekeeping consequence: `get-source-date-epoch.sh` aborts on a dirty tree unless `PRESET`
+is set, so **commit this chapter before attempting the blessed reproducible-build sequence**.
+
+---
+
 ## Verification
 
 Run in order; each step gates the next.
