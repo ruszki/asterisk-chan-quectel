@@ -1338,10 +1338,17 @@ directly — and note that `core show settings` prints build option **names**, n
 grep -Eao '[0-9a-f]{32}' build/src/chan_quectel.so | sort -u
 sed -n 's/.*AST_BUILDOPT_SUM.*"\([0-9a-f]*\)".*/\1/p' \
     ~/src/asterisk-22-configured/include/asterisk/buildopts.h
-grep -Eao '[0-9a-f]{32}' "$(command -v asterisk)" | sort -u | head
+grep -Fac da6642af068ee5e6490c5b1d2cc1d238 "$(command -v asterisk)"
 ```
 
-All three must contain `da6642af068ee5e6490c5b1d2cc1d238`.
+The first two must print `da6642af068ee5e6490c5b1d2cc1d238`; the third must print a non-zero count.
+
+The daemon keeps its own copy in `static char buildopt_sum[33] = AST_BUILDOPT_SUM;`
+(`main/loader.c:147`), so the string really is in the binary — but do **not** look for it with
+`grep -Eao '[0-9a-f]{32}' … | sort -u | head`. The daemon also contains long runs of decimal
+digits (float-conversion tables), which are valid `[0-9a-f]{32}` matches and sort *ahead* of any
+sum beginning with a letter, so `head` shows only those and hides the real answer. Grep for the
+expected value instead.
 
 #### 13. Install and load the module
 
@@ -1528,10 +1535,12 @@ Run in order; each step gates the next.
    `core show settings` prints build option *names*, never the md5 (`main/asterisk.c:502-503`),
    so the daemon's value has to come from its binary or its tree:
    ```sh
-   grep -Eao '[0-9a-f]{32}' build/src/chan_quectel.so | sort -u
-   grep -Eao '[0-9a-f]{32}' "$(command -v asterisk)" | sort -u | head
+   SUM=$(grep -Eao '[0-9a-f]{32}' build/src/chan_quectel.so | sort -u)
+   grep -Fac "$SUM" "$(command -v asterisk)"
    ```
-   Both must contain the same sum. See **Part E.5** step 12.
+   The module must yield exactly one sum and the daemon must contain it (non-zero count). Do not
+   list the daemon's 32-hex matches and eyeball the head of them — decimal-digit runs in the
+   binary also match and sort first. See **Part E.5** step 12.
 7. **Runtime load** (`install-chan-quectel.cmake` stages into `install/` via `DESTDIR` and
    dispatches to presets that do not exist — **B5**; use `cmake --install` directly, and see
    **Part E.5** step 13):
