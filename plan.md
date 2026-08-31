@@ -1099,10 +1099,22 @@ and `$AST_INC` = `~/src/asterisk-22-configured/include`.
 Confirm libsystemd was actually found, *before* you rely on `Type=notify`:
 
 ```sh
-grep -E '^PBX_SYSTEMD' ~/src/asterisk-22-configured/makeopts     # PBX_SYSTEMD=1
+grep -E '^HAVE_SYSTEMD|^SYSTEMD_LIB' ~/src/asterisk-22-configured/makeopts
+grep -E 'HAVE_SYSTEMD' ~/src/asterisk-22-configured/include/asterisk/autoconfig.h
 ```
 
-If it is `0`, install `libsystemd-dev` and redo step 4 with `FORCE=1`.
+Expect `HAVE_SYSTEMD=1` and `SYSTEMD_LIB=-lsystemd` in `makeopts`, and
+`#define HAVE_SYSTEMD 1` in `autoconfig.h`.
+
+`PBX_SYSTEMD` is the *autoconf* variable name (`configure.ac:2873`); it never appears in
+`makeopts`, which substitutes it under the `HAVE_` name — `makeopts.in:260` is
+`HAVE_SYSTEMD=@PBX_SYSTEMD@`. `autoconfig.h` is the one that matters at compile time: `main/io.c`
+guards both `#include <systemd/sd-daemon.h>` and the body of `ast_sd_notify()` with
+`#ifdef HAVE_SYSTEMD`, so without it `ast_sd_notify()` is a stub returning 0 and `READY=1` is
+never sent.
+
+If `HAVE_SYSTEMD` is `0` (or `autoconfig.h` still has `/* #undef HAVE_SYSTEMD */`), install
+`libsystemd-dev` and redo step 4 with `FORCE=1`.
 
 #### 5. Prefetch the sounds as yourself
 
@@ -1232,7 +1244,7 @@ ls -l /var/log/asterisk/full
 
 Assert: version `22.11.0`, `ABI related Build Options: OPTIONAL_API`, and a module directory of
 `/usr/lib/aarch64-linux-gnu/asterisk/modules`. A `Type=notify` unit that starts and is then killed
-after ~90 s means `PBX_SYSTEMD` was `0` at step 4 — go back and reconfigure with `FORCE=1`.
+after ~90 s means `HAVE_SYSTEMD` was `0` at step 4 — go back and reconfigure with `FORCE=1`.
 
 #### 11. Build the driver against that same tree
 
@@ -1348,7 +1360,7 @@ surface.
 | `Module was not compiled with the same compile-time options` | daemon and module came from different option sets | step 12; rebuild the driver against the tree the daemon was built from |
 | `module load` says *"Module not found"* | the `.so` is not in the daemon's `astmoddir` | compare step 13's `ls` with step 10's module directory — this is **B8** |
 | `Errors reading config file quectel.conf, Not loading module` | `quectel.conf` in `/usr/local/etc/asterisk` | `-DCMAKE_INSTALL_PREFIX=/usr` was missing at *configure* time; redo step 11 |
-| service starts, is killed ~90 s later | `Type=notify` without libsystemd | `PBX_SYSTEMD` was `0`; install `libsystemd-dev`, redo step 4 with `FORCE=1`, rebuild |
+| service starts, is killed ~90 s later | `Type=notify` without libsystemd | `HAVE_SYSTEMD` was `0` in `makeopts`; install `libsystemd-dev`, redo step 4 with `FORCE=1`, rebuild |
 | `Unable to connect to remote asterisk` from `asterisk -rx` | control-socket permissions | step 8's `[files]` stanza, then log out and back in; `sudo` meanwhile |
 | `Permission denied` on `/dev/ttyUSB*` | `asterisk` not in `dialout`, or ModemManager holds the port | step 6 and step 14 |
 | `./configure` hangs at third-party | no network for pjproject | `AST_DOWNLOAD_CACHE` with the tarballs staged |
