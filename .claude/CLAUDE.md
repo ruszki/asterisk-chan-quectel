@@ -87,9 +87,13 @@ ctest --preset deb
 Quick local variant, no reproducible-build wrapper:
 
 ```sh
-cmake -S . -B build -DASTERISK_VERSION_NUM=220000 -DAST_HEADER_DIR="$AST_INC"
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr -DASTERISK_VERSION_NUM=220000 -DAST_HEADER_DIR="$AST_INC"
 cmake -P build-chan-quectel.cmake default
 ```
+
+`CMAKE_INSTALL_PREFIX` has to be right at **configure** time: `quectel.conf` installs to the
+absolute `${CMAKE_INSTALL_FULL_SYSCONFDIR}/asterisk` (`src/CMakeLists.txt:60-64`), so a later
+`cmake --install --prefix=/usr` leaves it under `/usr/local/etc` and the module then fails to load.
 
 `make-build-dir.cmake` passes no `AST_HEADER_DIR`, so use the plain `cmake -S/-B` form above until
 a preset seeds it. **`jq`, `ninja`, `lintian` and `clang-format` are not installed on this dev
@@ -138,6 +142,16 @@ for 22, then `make include/asterisk/buildopts.h`, and prints `<dest-tree>/includ
 daemon from that same copy on the Pi so its `AST_BUILDOPT_SUM` matches the module's by
 construction.
 
+Env vars: `FORCE=1` reconfigures an existing destination (a re-run is otherwise a no-op),
+`AST_DOWNLOAD_CACHE=<dir>` makes `./configure` work offline, `AST_CODEC_ARGS` overrides the codec
+group, **`AST_PROFILE=headers|daemon`** picks between the lean header tree (default) and one that
+also yields a usable PBX — XML docs, English core sounds, music-on-hold, `format_gsm` — and
+**`AST_LIBDIR=<triplet>`** sets `--libdir=/usr/lib/<triplet>` (autodetected) so Asterisk's
+`astmoddir` matches where CMake installs the module. Both profiles pin
+`MENUSELECT_CFLAGS=OPTIONAL_API`, so `buildopts.h` is byte-identical between them:
+`AST_BUILDOPT_SUM` is a function of the option set, not of the host or the profile. See
+`plan.md` Part E.
+
 ### Build options
 
 Root `CMakeLists.txt:123-139`. Defaults in bold.
@@ -167,8 +181,10 @@ Compiled with `-Wall`, `_GNU_SOURCE`, `HAVE_CONFIG_H`,
 `ctest` only runs when building from a git checkout with `BUILD_TESTING=ON`
 (`src/CMakeLists.txt:66-122`). All tests inspect the built `.so`; none exercise driver logic:
 `Load library`, `Check library dependencies`, `Check comment section`,
-`Check architecture-specific metadata` (cross-compile only), and **`Check AST_BUILDOPT_SUM`** —
-the important one, verifying the module embeds the same `AST_BUILDOPT_SUM` as the target Asterisk.
+`Check architecture-specific metadata` (cross-compile only, so a native build runs **four**), and
+**`Check AST_BUILDOPT_SUM`**. That last one only proves *self*-consistency — it greps the module
+for the sum that came from the headers it compiled against, so it cannot detect a mismatch with an
+installed daemon; compare against the daemon's own binary for that (`plan.md` Part E.5 step 12).
 A mismatch is exactly what makes Asterisk refuse to load a module at runtime.
 
 `test/parse.c`, `test/gen.c`, `test/test1.c` are legacy standalone programs, **not** wired into
@@ -374,15 +390,19 @@ dropping `ast_channel_macrocontext()`; `chan_console.c`'s diff is comment-only. 
 
 ### Where Asterisk-22 work is still outstanding
 
+- Phase 1 is done (`plan.md` Part E): `tools/configure-asterisk-22.sh` gained `AST_PROFILE` and
+  `AST_LIBDIR`, and Part E.5 is the Raspberry Pi runbook for building and installing Asterisk
+  22.11.0 and loading the module. Phases 2–6 are untouched.
 - `ASTERISK_VERSION_NUM` currently affects only packaging: deb dependency `asterisk16` vs
   `asterisk` (`CMakeLists.txt:323`) and the OpenWRT package name plus `AST_HEADER_DIR`
   (`openwrt/CMakeLists.txt:18`).
 - No version pin anywhere exceeds `200100`: the docker Taskfiles (`docker/*/*/Taskfile.dist.yaml`)
   top out there. There is no 21 or 22 entry.
-- The `asterisk-22` branch carries no `src/` changes yet — only `plan.md`, `.claude/`,
+- The `asterisk-22` branch carries no `src/` changes — only `plan.md`, `.claude/`,
   `tools/configure-asterisk-22.sh` and the CI deletion. **`plan.md` at the repo root is the
   migration plan**: Part A the blocker inventory, Part B the ordered action list, Part C the
-  Phase 0 record, Part D the reference-tree re-baseline. Read it before starting version work.
+  Phase 0 record, Part D the reference-tree re-baseline, Part E the Phase 1 record and the
+  Raspberry Pi runbook. Read it before starting version work.
 - `README.md:19` still states the minimum is Asterisk 16 and gives no upper bound.
 
 ---

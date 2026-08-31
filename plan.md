@@ -71,6 +71,9 @@ the upstream tarball; full scope (build, packaging, docker, OpenWRT, docs);
 | B4 | **`AST_BUILDOPT_SUM` is computed from whatever `buildopts.h` is found.** `ShowAstBuildOptSum()` (`cmake/asterisk-headers.cmake:57-80`) `TRY_RUN`s `test/asterisk/AST_BUILDOPT_SUM.c` against the resolved include dir; the ctest (`cmake/test/AST_BUILDOPT_SUM.cmake`) then greps that 32-hex string out of the built `.so`. | `src/CMakeLists.txt:110`. | This is only a *self*-consistency check. It cannot detect a mismatch with the Asterisk actually installed on the Pi — and a mismatch is what makes Asterisk refuse to load the module (`main/loader.c:1836`). Building Asterisk and the driver from the same configured tree makes them match by construction. |
 | B5 | **`build-arm64` / `package-arm64` presets do not exist.** | `install-chan-quectel.cmake:5-11` and `make-package.cmake:5-11` dispatch to them; `CMakePresets.json` defines only `default` and `openwrt`; `get-build-flags.sh` generates only `deb`, `rpi`, `rpm`. | `./install-chan-quectel.cmake arm64` fails. |
 | B6 | **`clang-format` is found only under the bare name.** `FindClangFormat` (`cmake/clang-format.cmake:31`) does `FIND_PROGRAM(… NAME clang-format)`. Trixie's `clang-format` alternative is **19**; `ClangFormatFindAndCheck(18)` (`CMakeLists.txt:97`) then rejects it and silently skips the formatting targets. | `clang-format-18` (1:18.1.8-18) *is* packaged in trixie, just under a versioned binary name. | Formatting silently goes unchecked on the Pi. |
+| B8 | **The daemon and the module install to different directories.** | `astmoddir` is `${libdir}/asterisk/modules` (`configure.ac:41`) and `libdir` defaults to `${exec_prefix}/lib`, so `--prefix=/usr` gives `/usr/lib/asterisk/modules`; `src/CMakeLists.txt:44-51` installs to `/usr/lib/<triplet>/asterisk/modules`. | The daemon never sees `chan_quectel.so`, silently. **Fixed in Part E.3** (`AST_LIBDIR`). |
+| B9 | **`tools/configure-asterisk-22.sh` produces headers, not a usable daemon.** | It passes `--disable-xmldoc` and disables all six sound packages plus `format_gsm`. | A daemon built from that tree has no prompts, no music-on-hold, no `core show application`. **Fixed in Part E.3** (`AST_PROFILE`). |
+| B10 | **`make install` leaves the daemon unrunnable as a service.** | No Makefile target installs `contrib/systemd/`; only `make config` installs a SysV script (`Makefile:929-948`). No `useradd`/`--with-asterisk-user` anywhere. `contrib/systemd/asterisk.service` is `Type=notify`, needing libsystemd at configure time (`configure.ac:2876`), which `install_prereq` never installs. | Without the unit and the account the daemon runs only by hand as root; with `Type=notify` and no libsystemd it is killed at `TimeoutStartSec`. **Documented, not automated — Part E.5** steps 1, 6, 8, 9. |
 | B7 | ~~**Asterisk tree has no `.version`.**~~ **Closed by the tree re-baseline.** | Was: `build_tools/make_version:11-14` → `UNKNOWN__and_probably_unsupported` with neither `.version` nor `.git` — true of a GitHub dev-branch checkout. The release tarballs ship `.version` (`20.21.0`, `22.11.0`) and `make_version:7-10` reads it first. | None any more. See **Part D.3**. |
 
 ### A.3 Blockers — packaging (aarch64 / Debian 13)
@@ -112,6 +115,10 @@ the upstream tarball; full scope (build, packaging, docker, OpenWRT, docs);
 
 ### Phase 1 — Turn a copy of `asterisk-22` into the authoritative header source
 
+**Done — see Part E.** Steps 3 and 4 were already closed (Parts D.3 / D.6); step 4 gained
+`AST_PROFILE` and `AST_LIBDIR` (Part E.3), and step 5 is the Raspberry Pi runbook in **Part E.5**.
+Phase 1 also closed three blockers it discovered on the way: **B8**, **B9**, **B10** (Part E.2).
+
 3. ~~Write `.version`.~~ **Done for us** — the release tarball ships it (**B7** closed, Part D.3).
 4. **`tools/configure-asterisk-22.sh`** — **written** (Part D.6). It copies the reference tree and
    configures the *copy*, so the reference tree stays byte-identical to the upstream tarball and
@@ -141,7 +148,8 @@ the upstream tarball; full scope (build, packaging, docker, OpenWRT, docs);
      `make include/asterisk/buildopts.h` (`Makefile:417`), then asserts **both**
      `include/asterisk/autoconfig.h` and `include/asterisk/buildopts.h` exist. Fixes **B2**.
 5. **Build and install Asterisk 22.11.0 on the Pi from that same configured copy**
-   (`make -j$(nproc) && sudo make install && sudo make samples && sudo make config`).
+   — with `AST_PROFILE=daemon`, and `make samples OVERWRITE=y` rather than `make config`;
+   the full command list is **Part E.5**.
    Because the module and the daemon come from one configured tree — the copy made in step 4,
    not the pristine reference tree — their `AST_BUILDOPT_SUM`
    agree by construction and `main/loader.c:1836` will accept the module. Resolves **B4**.
@@ -490,11 +498,14 @@ pkg-config --modversion jansson
 Do **not** run `./configure` or `make` in `~/src/asterisk-22` — **ever**, not just "not yet".
 Keeping that tree byte-identical to the upstream tarball is what makes `diff` against it a
 trustworthy answer to API questions. Phase 1 step 4 works on a **copy**:
-`tools/configure-asterisk-22.sh ~/src/asterisk-22` writes `~/src/asterisk-22-configured` and
-prints the `AST_HEADER_DIR` to use. Configuring by hand would also skip the menuselect fixes the
+`AST_PROFILE=daemon tools/configure-asterisk-22.sh ~/src/asterisk-22` writes
+`~/src/asterisk-22-configured` and prints the `AST_HEADER_DIR` to use — see **Part E.5** for the
+full sequence. Configuring by hand would also skip the menuselect fixes the
 script carries (**X3**).
 
 ### C.3 — Status after Phase 0
+
+*(Superseded by **Part E.6**, which carries the state after Phase 1.)*
 
 | Blocker | State | Closed by |
 | --- | --- | --- |
@@ -761,6 +772,660 @@ sed -n '/^int ast_frame_adjust_volume(/,/^}/p' /home/quectel/asterisk-22/main/fr
 
 ---
 
+## Part E — Phase 1 implementation record
+
+Executed 2026-08-31. Phase 1 is `plan.md` steps 3–5. Steps 3 and 4 were already closed before this
+chapter began — the release tarball ships `.version` (**B7**, Part D.3) and
+`tools/configure-asterisk-22.sh` was written in `babddcc` (Part D.6) — so the work was step 5:
+**build and install Asterisk 22.11.0 on the Pi from the same configured copy the driver compiles
+against**, which is what makes their `AST_BUILDOPT_SUM` agree by construction (**B4**).
+
+Preparing step 5 exposed three things the script could not do yet. They are written up as **B8**,
+**B9** and **B10** in §E.2 and are fixed here; the Pi runbook in §E.5 assumes those fixes.
+Nothing under `src/`, `cmake/`, `docker/` or `openwrt/` was touched, and neither reference tree
+was configured in place.
+
+### E.1 — `AST_BUILDOPT_SUM` is a function of the option set, not of the host
+
+This is the fact the whole chapter rests on, and it was not established before.
+`build_tools/make_buildopts_h` hashes **only** `MENUSELECT_CFLAGS`, after deleting a fixed list of
+non-ABI flags — `AO2_DEBUG`, `BETTER_BACKTRACES`, `BUILD_NATIVE`, `COMPILE_DOUBLE`, `DEBUG_CHAOS`,
+`DEBUG_SCHEDULER`, `DONT_OPTIMIZE`, `DUMP_SCHEDULER`, `LOTS_OF_SPANS`, `MALLOC_DEBUG`,
+`RADIO_RELAX`, `REBUILD_PARSERS`, `REF_DEBUG`, `USE_HOARD_ALLOCATOR` and, uniquely in the checksum
+branch, `LOW_MEMORY`. `AST_DEVMODE` is excluded too, by its own comment.
+
+With this script's menuselect call the file `menuselect.makeopts` contains exactly:
+
+```
+MENUSELECT_CFLAGS=OPTIONAL_API
+```
+
+`OPTIONAL_API` is `<defaultenabled>yes</defaultenabled>` (`build_tools/cflags.xml:39-44`) and
+`BUILD_NATIVE` — the only other default-on flag (`:128-132`) — is switched off by the script and
+filtered out of the sum anyway. So the checksum is reproducible from first principles:
+
+```
+$ echo "OPTIONAL_API" | md5sum | cut -c1-32
+da6642af068ee5e6490c5b1d2cc1d238
+```
+
+which is precisely the value Part D.8 recorded. Three consequences:
+
+- **`.claude/CLAUDE.local.md` was wrong** to call `da6642af068ee5e6490c5b1d2cc1d238` "specific to
+  this host". It is specific to the *option set*. The Pi must produce the same string; if it does
+  not, the menuselect flags drifted and that is the bug.
+- **Sounds, XML documentation, the module `--enable`/`--disable` list, `--libdir` and every other
+  `./configure` flag are irrelevant to it.** That is what makes B8 and B9 safe to fix.
+- The `Check AST_BUILDOPT_SUM` ctest remains a *self*-consistency check only (**B4**): it greps
+  the module for the string that came from the very headers it compiled against. The real check is
+  §E.5 step 11.
+
+### E.2 — Three blockers Phase 1 surfaced
+
+| # | Blocker | Evidence | Effect |
+| --- | --- | --- | --- |
+| B8 | **The daemon and the module install to different directories.** | Asterisk's `astmoddir` is `${libdir}/asterisk/modules` (`configure.ac:41` → `makeopts.in:98`) and `libdir` defaults to `${exec_prefix}/lib`, so `--prefix=/usr` gives `/usr/lib/asterisk/modules`. chan-quectel installs to `lib/${CMAKE_LIBRARY_ARCHITECTURE}/asterisk/modules` (`src/CMakeLists.txt:44-51`) = `/usr/lib/aarch64-linux-gnu/asterisk/modules`. | The daemon would never see `chan_quectel.so`. Silent: no error, the module simply is not there. |
+| B9 | **The script produces headers, not a usable daemon.** | It passes `--disable-xmldoc` and `--disable`s all six `CORE-SOUNDS-EN-*` / `MOH-OPSOUND-*` packages, plus `format_gsm`. | A daemon built from that tree has no prompt files, no music-on-hold and empty `core show application` output. |
+| B10 | **`make install` leaves the daemon unrunnable as a service.** | It installs no systemd unit — `contrib/systemd/` is referenced by no Makefile target — and only `make config` installs anything, a SysV script (`Makefile:929-948`), which is the wrong artefact on trixie. It creates no `asterisk` user or group either (no `useradd`/`adduser` anywhere in `Makefile`, `configure.ac` or `contrib/`; there is no `--with-asterisk-user`). And `contrib/systemd/asterisk.service` is `Type=notify`, which needs `libsystemd` at `./configure` time (`configure.ac:2876`) — `contrib/scripts/install_prereq` never installs `libsystemd-dev`. | Without the unit and the account the daemon can only be run by hand as root; with `Type=notify` but no libsystemd it starts and is then killed at `TimeoutStartSec`. |
+
+Two related traps found while validating the runbook, recorded here because they bite at exactly
+this point and are *not* Asterisk-22 issues:
+
+- **The driver's install prefix must be set at configure time, not install time.**
+  `quectel.conf`'s destination is `${CMAKE_INSTALL_FULL_SYSCONFDIR}/asterisk`
+  (`src/CMakeLists.txt:60-64`), an **absolute** path baked in by `INCLUDE(GNUInstallDirs)`
+  (`CMakeLists.txt:272`). CMake does not relocate absolute destinations, so
+  `cmake --install … --prefix=/usr` on a tree configured with the default prefix is not enough.
+  Demonstrated in §E.4. The consequence is a hard load failure, not a warning:
+  `reload_config()` returning non-zero makes `chan_quectel.c:1465-1468` log
+  `Errors reading config file quectel.conf, Not loading module`.
+- **`asterisk -rx` needs privileges.** `[files]` is commented out in
+  `configs/samples/asterisk.conf.sample:149-154`, so the control socket is created under the
+  daemon's own user with the default umask and a login user gets `EACCES`. Either use `sudo`, or
+  set `astctlgroup`/`astctlpermissions` and join the group.
+
+### E.3 — What changed in the repository
+
+Only `tools/configure-asterisk-22.sh`, plus documentation. The script keeps its existing contract
+exactly — positional `<src-tree>` / `<dest-tree>`, `ASTERISK_22_SRC`, `ASTERISK_22_BUILD`, `FORCE`,
+`AST_DOWNLOAD_CACHE`, `AST_CODEC_ARGS`, the configured-tree assertion, and the discipline that
+stdout carries nothing but the path.
+
+**`AST_LIBDIR` — fixes B8.** The Debian multiarch triplet is autodetected once
+(`dpkg-architecture -qDEB_HOST_MULTIARCH`, falling back to `${CC:-gcc} -print-multiarch`) and, when
+non-empty, passed as `--libdir=/usr/lib/<triplet>`. `AST_LIBDIR=` (explicitly empty) restores
+autoconf's `/usr/lib` for non-Debian hosts. Nothing else has to move:
+
+- rpath is untouched — `configure.ac:1506-1509` reports "not needed" whenever `prefix` is `/usr`,
+  and `/usr/lib/<triplet>` is already on Debian's loader path, so `libasteriskssl.so.1` and
+  `libasteriskpj.so.2` resolve. `make install` runs `ld-cache-update` regardless (`Makefile:753`).
+- `Makefile:650-663` computes `_oldlibdir` only when the libdir's basename is `lib` or `lib64`.
+  A multiarch basename matches neither, so the lib/lib64 orphan check quietly stands down instead
+  of misfiring — it is meaningless here anyway.
+
+**`AST_PROFILE` — fixes B9.** `headers` (the default) reproduces the previous behaviour; `daemon`
+changes three things and nothing else:
+
+1. omits `--disable-xmldoc` — that flag is an `AC_SUBST`'d makeopts variable
+   (`configure.ac:795-805`), not a `MENUSELECT_CFLAG`;
+2. turns the six `--disable CORE-SOUNDS-EN-*` / `--disable MOH-OPSOUND-*` arguments into
+   `--enable`. `EXTRA-SOUNDS-EN-*` stays off in both profiles;
+3. re-enables `format_gsm`. The sound packages and the format modules that read them travel
+   together: `.gsm` needs `format_gsm`, which the inherited CI list disabled, while `.wav` is
+   `format_wav` and `.g722` is `format_pcm` (`formats/format_pcm.c:519-526`) — both already kept.
+   `format_wav_gsm` stays disabled; it handles WAV49, which no sound package here ships.
+
+`--disable BUILD_NATIVE` is **kept in both profiles**, deliberately: it is filtered out of the
+checksum, and leaving `-march=native` off means a Pi 5 (Cortex-A76) build does not `SIGILL` on a
+Pi 4 (Cortex-A72).
+
+Every other argument — the whole `--without-*` list, the adaptive codec group, the module
+selection — is shared, so `MENUSELECT_CFLAGS` is `OPTIONAL_API` under either profile and
+`buildopts.h` is byte-identical between them. §E.4 verifies that rather than asserting it.
+
+The stderr summary now also reports the profile and the resulting module directory, and the
+`daemon` profile prints the `make`/`make install` follow-up. An unknown `AST_PROFILE` is a `die`.
+
+Documentation touched: this chapter; `.claude/CLAUDE.md` §1 ("Finding the Asterisk headers");
+`.claude/CLAUDE.local.md` (the two new variables, the corrected "specific to this host" sentence,
+and the fact that `/home/quectel/asterisk-22-configured` now genuinely exists — the Part D.8
+destination had been transient).
+
+### E.4 — Dev-box verification actually run
+
+All of it against **copies**; `/home/quectel/asterisk-22` is still byte-identical to the tarball
+(`test ! -e .../include/asterisk/autoconfig.h` still succeeds, before and after).
+
+**Both profiles, side by side.** The whole argument of §E.1, checked rather than asserted:
+
+```
+$ tools/configure-asterisk-22.sh /home/quectel/asterisk-22
+AST_BUILDOPT_SUM: da6642af068ee5e6490c5b1d2cc1d238
+Asterisk 22.11.0 configured in /home/quectel/asterisk-22-configured  (profile: headers)
+Module directory: /usr/lib/x86_64-linux-gnu/asterisk/modules
+
+$ AST_PROFILE=daemon tools/configure-asterisk-22.sh /home/quectel/asterisk-22 <dest>
+AST_BUILDOPT_SUM: da6642af068ee5e6490c5b1d2cc1d238
+Asterisk 22.11.0 configured in <dest>  (profile: daemon)
+Module directory: /usr/lib/x86_64-linux-gnu/asterisk/modules
+
+$ diff <hdr>/include/asterisk/buildopts.h <dest>/include/asterisk/buildopts.h
+$ diff <(grep ^MENUSELECT_CFLAGS <hdr>/menuselect.makeopts) \
+       <(grep ^MENUSELECT_CFLAGS <dest>/menuselect.makeopts)
+```
+
+Both diffs are **empty**, and both trees carry `MENUSELECT_CFLAGS=OPTIONAL_API`. The profiles do
+differ where they are meant to:
+
+| | headers | daemon |
+| --- | --- | --- |
+| `makeopts` `DISABLE_XMLDOC` | `yes` | `no` |
+| `MENUSELECT_CORE_SOUNDS` | *(empty)* | `CORE-SOUNDS-EN-WAV CORE-SOUNDS-EN-GSM CORE-SOUNDS-EN-G722` |
+| `MENUSELECT_MOH` | *(empty)* | `MOH-OPSOUND-WAV MOH-OPSOUND-GSM MOH-OPSOUND-G722` |
+| `format_gsm` | in `MENUSELECT_FORMATS` (disabled) | absent (enabled) |
+| `MENUSELECT_EXTRA_SOUNDS` | *(empty)* | *(empty)* |
+
+Those categories are `positive_output="yes"` (`sounds/sounds.xml:1,274,304`), so a listed member is
+an **enabled** one; `MENUSELECT_FORMATS` is the opposite polarity and lists what is off.
+
+**The libdir fix (B8).** `makeopts` in the configured copy now reads `libdir = /usr/lib/x86_64-linux-gnu`
+with `ASTMODDIR = ${libdir}/asterisk/modules`, and CMake independently reports
+`Installing module on architecture-specific directory - lib/x86_64-linux-gnu/asterisk/modules`.
+On the Pi both read `aarch64-linux-gnu`.
+
+**The driver still builds and tests clean**:
+
+```
+$ cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr -DASTERISK_VERSION_NUM=220000 \
+        -DAST_HEADER_DIR=/home/quectel/asterisk-22-configured/include -DBUILD_TESTING=ON
+-- Asterisk version: 220000 [cached]
+-- Looking for asterisk.h - found
+-- Asterisk header directory: /home/quectel/asterisk-22-configured/include/
+-- Getting AST_BUILDOPT_SUM - da6642af068ee5e6490c5b1d2cc1d238
+
+$ cmake --build build -j$(nproc) && ctest --test-dir build
+100% tests passed, 0 tests failed out of 4
+```
+
+**Four**, not five — `Check architecture-specific metadata` is gated on `CMAKE_CROSSCOMPILING`
+(`src/CMakeLists.txt:95`) and does not run natively. The `## Verification` section below said
+"five"; that is corrected. The only warnings are the pre-existing ones from Part D.8.
+
+**The install-prefix trap, demonstrated.** Two builds of the same tree, each staged with `DESTDIR`:
+
+```
+# configured with -DCMAKE_INSTALL_PREFIX=/usr
+/etc/asterisk/quectel.conf
+/usr/lib/x86_64-linux-gnu/asterisk/modules/chan_quectel.so
+
+# configured with the default prefix, then `cmake --install ... --prefix=/usr`
+/usr/local/etc/asterisk/quectel.conf          <-- wrong, and fatal at load time
+/usr/lib/x86_64-linux-gnu/asterisk/modules/chan_quectel.so
+```
+
+`--prefix` at install time relocates the module (a relative `DESTINATION`) but **not**
+`quectel.conf`, whose `DESTINATION` is the absolute `${CMAKE_INSTALL_FULL_SYSCONFDIR}/asterisk`.
+Hence `-DCMAKE_INSTALL_PREFIX=/usr` at *configure* time in §E.5 step 9.
+
+**Sound prefetch works unprivileged.** The tarball ships only two of the six packages
+(`sounds/asterisk-core-sounds-en-gsm-1.6.1.tar.gz`, `sounds/asterisk-moh-opsound-wav-2.03.tar.gz`);
+the other four are fetched from `downloads.asterisk.org`. `sounds` is not in `SUBDIRS`
+(`Makefile:280-282`), so under a plain `sudo make install` that download happens **as root**.
+Doing it first as the normal user avoids root-owned files:
+
+```
+$ cd <dest> && make -C sounds all ASTTOPDIR="$PWD"
+... asterisk-core-sounds-en-{wav,g722}, asterisk-moh-opsound-{gsm,g722} downloaded
+```
+
+~58 MB total, all six then present in `sounds/`.
+
+**What could not be checked here.** No `asterisk` daemon, no `jq`, no `ninja`, no `lintian`, no
+`clang-format` (Part D.4), and the box is x86-64 — so the daemon build, the runtime load, GCC 14
+(**X6**) and packaging are all Pi-only. That is §E.5.
+
+### E.5 — Raspberry Pi command list (Phase 1, step 5)
+
+Everything below runs **on the Pi**, as the normal login user (member of `sudo`). It assumes
+**§C.2 is done**: base packages installed, the repo cloned at `~/src/asterisk-chan-quectel` on
+branch `asterisk-22` with the tag visible, and the verified `asterisk-22.11.0` tarball unpacked at
+`~/src/asterisk-22`.
+
+Run the blocks in order and check the expected output before moving on. Where a block says
+*assert*, stop if it does not hold.
+
+> **`~/src/asterisk-22` is still never configured or built in place.** Every command below that
+> compiles anything runs in `~/src/asterisk-22-configured`, the copy step 4 creates.
+
+#### 0. Space, and where the time goes
+
+```sh
+uname -m                        # aarch64
+df -h /                         # need >= 10 GB free
+free -m
+nproc
+```
+
+Budget: the configured copy grows to ~2.5–4 GB during a full build (bundled pjproject 2.17, all
+modules, XML docs), the sound tarballs add ~58 MB, and the install ~350–500 MB. Wall time is
+dominated by pjproject (15–25 min) — roughly 45–70 min total on a Pi 5, 2–3 h on a Pi 4.
+
+Pick the parallelism now and use the same `N` everywhere below:
+
+```sh
+N=$(( $(free -g | awk '/^Mem:/{print $2}') < $(nproc) ? $(free -g | awk '/^Mem:/{print $2}') : $(nproc) ))
+[ "$N" -lt 1 ] && N=1
+echo "using -j$N"
+```
+
+One GB of RAM per job is the rule of thumb. On a 2 GB Pi also do the `dphys-swapfile` bump from
+§C.2 step 5.
+
+#### 1. The packages Phase 0 did not cover
+
+```sh
+sudo apt install -y libsystemd-dev
+```
+
+**This must happen before step 4**, not after. `contrib/systemd/asterisk.service` is `Type=notify`,
+which only works if Asterisk was linked against libsystemd — and `./configure` decides that
+(`configure.ac:2876`). `contrib/scripts/install_prereq` does **not** install it, so §C.2 step 4 did
+not bring it in. If you get here late, redo step 4 with `FORCE=1`.
+
+Optional, only if you want those codecs in the daemon — the script demotes each to `--without-`
+when `pkg-config` cannot see it (none is needed by `chan_quectel`):
+
+```sh
+sudo apt install -y libopus-dev libopusfile-dev libogg-dev libspeexdsp-dev
+```
+
+Also worth having on a modem host:
+
+```sh
+sudo apt install -y usb-modeswitch socat
+```
+
+#### 2. Pick up the updated driver repository
+
+```sh
+cd ~/src/asterisk-chan-quectel
+git status --short                                          # must be empty
+git pull --ff-only
+git describe --abbrev=6 --dirty --match "v*" --long --tags   # assert: starts with v2026.08.30-
+```
+
+The tag gate at `CMakeLists.txt:48-69` fires on **every** plain `cmake -S . -B`, so assert it here
+rather than discovering it in step 9. If it prints `fatal: No names found`, run
+`git fetch --tags`, and only then fall back to `cmake -P make-release-tag.cmake` on a clean tree.
+
+#### 3. A download cache
+
+```sh
+mkdir -p ~/.cache/asterisk-src
+```
+
+`third-party/{pjproject,jansson,libjwt}` are fetched during `./configure`, and the sound tarballs
+during the build. Pointing both at a cache means a later `FORCE=1` reconfigure does not
+re-download, and makes an offline rebuild possible.
+
+#### 4. Configure the copy — daemon profile
+
+```sh
+cd ~/src/asterisk-chan-quectel
+AST_INC=$(AST_PROFILE=daemon AST_DOWNLOAD_CACHE=~/.cache/asterisk-src \
+          tools/configure-asterisk-22.sh ~/src/asterisk-22)
+echo "$AST_INC"
+```
+
+Assert, on stderr:
+
+```
+AST_BUILDOPT_SUM: da6642af068ee5e6490c5b1d2cc1d238
+Asterisk 22.11.0 configured in /home/<user>/src/asterisk-22-configured  (profile: daemon)
+Module directory: /usr/lib/aarch64-linux-gnu/asterisk/modules
+```
+
+and `$AST_INC` = `~/src/asterisk-22-configured/include`.
+
+- **A different checksum means the menuselect flags drifted.** It is derived from
+  `MENUSELECT_CFLAGS=OPTIONAL_API` and nothing else (§E.1) — do not proceed; diff
+  `menuselect.makeopts` against this document.
+- **`Already configured: … (set FORCE=1 to redo)` means nothing was reconfigured.** The script
+  cannot tell which profile built an existing destination. Any re-run — after installing
+  `libsystemd-dev`, after changing profile — needs `FORCE=1 AST_PROFILE=daemon …`.
+- `./configure` needs network here (pjproject). Offline, stage the three tarballs into
+  `~/.cache/asterisk-src` first.
+
+Confirm libsystemd was actually found, *before* you rely on `Type=notify`:
+
+```sh
+grep -E '^PBX_SYSTEMD' ~/src/asterisk-22-configured/makeopts     # PBX_SYSTEMD=1
+```
+
+If it is `0`, install `libsystemd-dev` and redo step 4 with `FORCE=1`.
+
+#### 5. Prefetch the sounds as yourself
+
+```sh
+cd ~/src/asterisk-22-configured
+make -C sounds all ASTTOPDIR="$PWD"
+ls -1 sounds/*.tar.gz | wc -l        # 6
+```
+
+The tarball ships only 2 of the 6 packages; the rest come from `downloads.asterisk.org`. `sounds`
+is not in `SUBDIRS` (`Makefile:280-282`), so skipping this makes `sudo make install` download them
+**as root** and leave root-owned files in your cache.
+
+#### 6. Create the service account before installing
+
+```sh
+sudo adduser --system --group --home /var/lib/asterisk --no-create-home \
+             --disabled-login --gecos "Asterisk PBX" asterisk
+sudo usermod -aG dialout,audio asterisk
+id asterisk
+```
+
+Asterisk's build system creates no user and has no `--with-asterisk-user`; nothing in `make install`
+does this for you. `dialout` is the modem TTYs (`src/tty.c` opens them with `TIOCEXCL` + `flock`);
+`audio` is only needed in UAC mode, but costs nothing.
+
+#### 7. Build and install the daemon
+
+```sh
+cd ~/src/asterisk-22-configured
+make -j"$N"
+sudo make install
+sudo make samples OVERWRITE=y
+sudo make install-logrotate
+```
+
+- `make install` depends on `_all`, so build explicitly first with your chosen `-j` — otherwise it
+  builds serially under `sudo`.
+- **Not `make config`.** That installs the SysV script from `contrib/init.d/rc.debian.asterisk`
+  and runs `update-rc.d` (`Makefile:940-948`) — the wrong artefact on trixie. Step 9 installs the
+  systemd unit instead.
+- **Not `make install-headers`.** It would recreate `/usr/include/asterisk`, exactly the fallback
+  Part D.4 deliberately removed; the driver takes its headers from `$AST_INC`.
+- `OVERWRITE=y` on `make samples` is belt-and-braces. On a fresh `/etc/asterisk` the file copying
+  is identical either way, but the path-rewriting `sed` in `INSTALL_CONFIGS` (`Makefile:782-800`)
+  runs **only** under `OVERWRITE=y`, and that is what makes `asterisk.conf`'s `astmoddir` line
+  agree with the multiarch directory. It is inert as shipped — the stanza is a template,
+  `[directories](!)` — but leaving a stale `/usr/lib/asterisk/modules` in there is a trap for
+  whoever later removes the `(!)`. On a **re-install** `OVERWRITE=y` renames your existing configs
+  to `*.old`; back up `/etc/asterisk` first.
+
+Then assert the daemon and the module agree on where modules live:
+
+```sh
+grep '^astmoddir' /etc/asterisk/asterisk.conf     # => /usr/lib/aarch64-linux-gnu/asterisk/modules
+ls -d /usr/lib/aarch64-linux-gnu/asterisk/modules
+command -v asterisk; readlink -f /usr/sbin        # note whether /usr/sbin is merged into /usr/bin
+```
+
+#### 8. Ownership and `asterisk.conf`
+
+```sh
+sudo chown -R asterisk:asterisk /var/lib/asterisk /var/log/asterisk \
+                                /var/spool/asterisk /var/cache/asterisk
+sudo chown -R root:asterisk /etc/asterisk
+sudo chmod -R o-rwx /etc/asterisk
+```
+
+`/var/run/asterisk` is deliberately **not** in that list — it lives on tmpfs and is recreated on
+every start by `RuntimeDirectory=asterisk` in step 9.
+
+Edit `/etc/asterisk/asterisk.conf`, in `[options]`:
+
+```ini
+runuser  = asterisk
+rungroup = asterisk
+```
+
+and, so that `asterisk -rx` works without `sudo`, in `[files]`:
+
+```ini
+astctlpermissions = 0660
+astctlowner       = asterisk
+astctlgroup       = asterisk
+```
+
+then
+
+```sh
+sudo usermod -aG asterisk "$USER"      # takes effect at your next login
+```
+
+Both stanzas are commented out in the shipped sample (`asterisk.conf.sample:79-80,149-154`), so
+without this the control socket is owned by `asterisk` with no group access and every
+`asterisk -rx` from your login shell fails with `Unable to connect to remote asterisk`. Until you
+log out and back in, prefix the CLI commands below with `sudo`.
+
+#### 9. systemd unit
+
+```sh
+sudo install -m 644 ~/src/asterisk-22-configured/contrib/systemd/asterisk.service \
+                    /etc/systemd/system/asterisk.service
+sudo sed -i -e 's|^#RuntimeDirectory=asterisk|RuntimeDirectory=asterisk|' \
+            -e "s|^ExecStart=.*asterisk |ExecStart=$(command -v asterisk) |" \
+            -e "s|^ExecReload=.*asterisk |ExecReload=$(command -v asterisk) |" \
+            /etc/systemd/system/asterisk.service
+grep -E '^(ExecStart|ExecReload|RuntimeDirectory|User|Group|Type)=' /etc/systemd/system/asterisk.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now asterisk
+```
+
+Nothing in Asterisk's build system installs this file — `contrib/systemd/` is referenced by no
+Makefile target — so the copy is mandatory. The shipped unit hardcodes `/usr/sbin/asterisk` while
+the script configures `--sbindir=/usr/bin`; on trixie `/usr/sbin` is merged into `/usr/bin` so both
+resolve, but the `sed` above makes it explicit rather than depending on that. `RuntimeDirectory`
+ships commented out, and without it `/var/run/asterisk` does not exist on a tmpfs `/run`.
+
+#### 10. Verify the daemon
+
+```sh
+systemctl status asterisk --no-pager
+journalctl -u asterisk -b --no-pager | tail -40
+asterisk -rx 'core show settings'  | grep -Ei 'version|build options|module directory|user|group'
+asterisk -rx 'module show like pjsip' | tail -3
+ls -l /var/log/asterisk/full
+```
+
+Assert: version `22.11.0`, `ABI related Build Options: OPTIONAL_API`, and a module directory of
+`/usr/lib/aarch64-linux-gnu/asterisk/modules`. A `Type=notify` unit that starts and is then killed
+after ~90 s means `PBX_SYSTEMD` was `0` at step 4 — go back and reconfigure with `FORCE=1`.
+
+#### 11. Build the driver against that same tree
+
+Independent of steps 6–10: this needs only `$AST_INC`, not a running daemon. If `$AST_INC` is no
+longer set in your shell, it is `~/src/asterisk-22-configured/include`.
+
+```sh
+cd ~/src/asterisk-chan-quectel
+cmake -S . -B build \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DASTERISK_VERSION_NUM=220000 \
+      -DAST_HEADER_DIR="$AST_INC" \
+      -DBUILD_TESTING=ON \
+      -DCLANG_FORMAT=/usr/bin/clang-format-18
+cmake --build build -j"$N" 2>&1 | tee /tmp/chan-quectel-build.log
+ctest --test-dir build
+```
+
+- **`-DCMAKE_INSTALL_PREFIX=/usr` is not optional and cannot be deferred to install time.**
+  `quectel.conf`'s destination is absolute (§E.2, demonstrated in §E.4); get this wrong and the
+  file lands in `/usr/local/etc/asterisk` and the module refuses to load.
+- `-DCLANG_FORMAT=…` is the **B6** workaround until Phase 2 step 9 — trixie's unversioned
+  `clang-format` is 19 and `ClangFormatFindAndCheck(18)` rejects it.
+- Expect `4 tests passed` — `Check architecture-specific metadata` is cross-compile-only.
+  `Check library dependencies` should report only `libasound`, `libsqlite3`, `libc`, `libgcc_s`
+  and `ld-linux-aarch64.so.1`; anything else is a one-line `ALLOWED_LIBS` fix in
+  `cmake/test/needed-libs.cmake`, not a porting problem.
+- **X6, the real point of building here:** GCC 14 promotes `-Wimplicit-function-declaration`,
+  `-Wincompatible-pointer-types`, `-Wint-conversion` and `-Wreturn-mismatch` to errors. Skim the
+  log — `grep -E 'warning|error' /tmp/chan-quectel-build.log`. The only expected warning is the
+  pre-existing `src/memmem.c:55: -Wdiscarded-qualifiers`.
+
+```sh
+readelf -hW build/src/chan_quectel.so | grep -E 'Machine|Type'   # AArch64, DYN
+```
+
+#### 12. Prove B4 — the check `ctest` structurally cannot make
+
+`Check AST_BUILDOPT_SUM` only greps the module for the string that came from the headers it was
+compiled against; it can never detect a mismatch with the *installed* daemon. Compare them
+directly — and note that `core show settings` prints build option **names**, never the checksum
+(`main/asterisk.c:502-503`), so the daemon's value has to come from the binary or the tree:
+
+```sh
+grep -Eao '[0-9a-f]{32}' build/src/chan_quectel.so | sort -u
+sed -n 's/.*AST_BUILDOPT_SUM.*"\([0-9a-f]*\)".*/\1/p' \
+    ~/src/asterisk-22-configured/include/asterisk/buildopts.h
+grep -Eao '[0-9a-f]{32}' "$(command -v asterisk)" | sort -u | head
+```
+
+All three must contain `da6642af068ee5e6490c5b1d2cc1d238`.
+
+#### 13. Install and load the module
+
+```sh
+sudo cmake --install build --component chan-quectel
+ls -l /usr/lib/aarch64-linux-gnu/asterisk/modules/chan_quectel.so
+ls -l /etc/asterisk/quectel.conf
+```
+
+No `--prefix` here: it was fixed at configure time in step 11. Both files must exist, and the
+module's directory must be the one step 10 reported.
+
+`modules.conf.sample:8` is `autoload=yes`, so a restart loads the module by itself and a subsequent
+`module load` would answer *"Module chan_quectel.so already exists"*. Load it explicitly instead,
+without restarting:
+
+```sh
+sudo asterisk -rx 'module load chan_quectel.so'
+asterisk -rx 'module show like chan_quectel'
+asterisk -rx 'core show channeltype Quectel'
+asterisk -rx 'core show taskprocessors like chan-quectel'
+asterisk -rx 'quectel show devices'
+```
+
+A mismatch of the kind step 12 guards against surfaces right here, as Asterisk refusing the module
+(`main/loader.c:1836`): *"Module was not compiled with the same compile-time options"*.
+
+#### 14. Point it at the modem
+
+`quectel.conf` ships a **live** `[quectel0]` with `audio=/dev/ttyUSB1` and `data=/dev/ttyUSB2`
+(`quectel.conf:44-46`), so the module loads but the device stays down if your enumeration differs.
+
+```sh
+ls -l /dev/serial/by-id/
+dmesg | grep -i ttyUSB | tail
+sudoedit /etc/asterisk/quectel.conf
+sudo asterisk -rx 'quectel reload now'
+asterisk -rx 'quectel show devices'         # the device should reach Free
+```
+
+**Disable ModemManager first** — it opens `/dev/ttyUSB*` on hotplug and will lose the race against
+`TIOCEXCL` + `flock`:
+
+```sh
+sudo systemctl disable --now ModemManager
+```
+
+Optional, for stable names: the IMEI/IMSI udev rules in `tools/udev/` (they need `socat`) create
+`/dev/modem/by-imei/*` symlinks — see `tools/udev/README.md`.
+
+#### 15. Smoke test
+
+With a modem attached and registered: place and answer a call (exercises `channel_tech` and the
+audio path), send an SMS with `QUECTEL_SEND_SMS`, and confirm an inbound SMS reaches the `sms`
+extension (`pdu.c` → `smsdb.c` → `channel_start_local_json()`). See `README.md` for the dialplan
+surface.
+
+#### 16. If something goes wrong
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `Module was not compiled with the same compile-time options` | daemon and module came from different option sets | step 12; rebuild the driver against the tree the daemon was built from |
+| `module load` says *"Module not found"* | the `.so` is not in the daemon's `astmoddir` | compare step 13's `ls` with step 10's module directory — this is **B8** |
+| `Errors reading config file quectel.conf, Not loading module` | `quectel.conf` in `/usr/local/etc/asterisk` | `-DCMAKE_INSTALL_PREFIX=/usr` was missing at *configure* time; redo step 11 |
+| service starts, is killed ~90 s later | `Type=notify` without libsystemd | `PBX_SYSTEMD` was `0`; install `libsystemd-dev`, redo step 4 with `FORCE=1`, rebuild |
+| `Unable to connect to remote asterisk` from `asterisk -rx` | control-socket permissions | step 8's `[files]` stanza, then log out and back in; `sudo` meanwhile |
+| `Permission denied` on `/dev/ttyUSB*` | `asterisk` not in `dialout`, or ModemManager holds the port | step 6 and step 14 |
+| `./configure` hangs at third-party | no network for pjproject | `AST_DOWNLOAD_CACHE` with the tarballs staged |
+| step 4 prints `Already configured` and changes nothing | destination exists | re-run with `FORCE=1` |
+| `Git - unable to describe` from CMake | tag missing after clone | `git fetch --tags`, else `cmake -P make-release-tag.cmake` (**B1**) |
+
+Rollback: `sudo systemctl disable --now asterisk`, `sudo rm /etc/systemd/system/asterisk.service`,
+`cd ~/src/asterisk-22-configured && sudo make uninstall`. `make uninstall-all` additionally
+`rm -rf`s `/etc/asterisk`, `/var/lib/asterisk` and the spool — do not run it casually.
+
+### E.6 — Status after Phase 1
+
+| Blocker | State | Closed by |
+| --- | --- | --- |
+| **B1** no git tag | Fixed | Phase 0 |
+| **B2** unconfigured tree → `Asterisk header not found.` | Fixed in practice; the misleading *message* is still Phase 2, step 7 | Part D.6 |
+| B3 `ASTERISK_VERSION_NUM` defaults to `180000` | open, still masked | Phase 2, step 6 |
+| **B4** `AST_BUILDOPT_SUM` self-consistency only | **Closed by construction on the dev box** (§E.4) — the daemon half is §E.5 steps 4/12 on the Pi. The *ctest* remains self-consistency-only, by design | Phase 1, §E.1/§E.4 |
+| B5 missing `build-arm64` / `package-arm64` presets | open — §E.5 step 13 sidesteps it with a direct `cmake --install` | Phase 3, step 12 |
+| B6 `clang-format` found only under the bare name | open (workaround `-DCLANG_FORMAT=/usr/bin/clang-format-18`, §E.5 step 11) | Phase 2, step 9 |
+| **B7** Asterisk tree has no `.version` | Fixed | tree re-baseline (Part D.3) |
+| **B8** daemon and module install to different directories | **Fixed** — `AST_LIBDIR` → `--libdir=/usr/lib/<triplet>` | Phase 1, §E.3 |
+| **B9** script produces headers, not a usable daemon | **Fixed** — `AST_PROFILE=daemon` | Phase 1, §E.3 |
+| **B10** `make install` leaves the daemon unrunnable as a service | **Documented, not automated** — §E.5 steps 1, 6, 8, 9. Nothing in the repo installs a unit or creates the account, and nothing here changes that | Phase 1, §E.5 |
+| P1–P4 packaging | open | Phase 3 |
+| P5, P6 | verified already correct — do not "fix" | — |
+| X1, X2 docker | open | Phase 4 |
+| **X3** menuselect list invalid for 22 | Fixed | Part D.6 |
+| X4 OpenWRT | open | Phase 5 |
+| X5 README | open | Phase 6 |
+| X6 GCC 14 promoted warnings | **still unverified** — needs the real build at §E.5 step 11 | §E.5, step 11 |
+
+Two corrections to earlier text, both made:
+
+- **`## Verification` step 3 said "All five tests must pass".** It is **four** on a native build;
+  `Check architecture-specific metadata` is gated on `CMAKE_CROSSCOMPILING` (`src/CMakeLists.txt:95`).
+- **`## Verification` step 6 asked to read the checksum out of `core show settings`.** That command
+  prints build option *names* (`main/asterisk.c:502-503`), never the md5. §E.5 step 12 has the
+  working comparison.
+
+`src/` is still untouched on this branch, and there is still no `#if ASTERISK_VERSION_NUM` guard
+anywhere.
+
+### E.7 — How to re-check this chapter
+
+```sh
+cd /home/quectel/asterisk-chan-quectel
+
+# the reference trees are still pristine
+test ! -e /home/quectel/asterisk-20/include/asterisk/autoconfig.h
+test ! -e /home/quectel/asterisk-22/include/asterisk/autoconfig.h && echo pristine
+
+# the checksum is derivable, not observed
+echo "OPTIONAL_API" | md5sum | cut -c1-32      # da6642af068ee5e6490c5b1d2cc1d238
+
+# the two profiles agree on everything the checksum sees
+AST_PROFILE=daemon FORCE=1 tools/configure-asterisk-22.sh /home/quectel/asterisk-22 /tmp/ast22-d
+diff /home/quectel/asterisk-22-configured/include/asterisk/buildopts.h \
+     /tmp/ast22-d/include/asterisk/buildopts.h                          # empty
+diff <(grep ^MENUSELECT_CFLAGS /home/quectel/asterisk-22-configured/menuselect.makeopts) \
+     <(grep ^MENUSELECT_CFLAGS /tmp/ast22-d/menuselect.makeopts)        # empty
+grep -E '^(DISABLE_XMLDOC)' /home/quectel/asterisk-22-configured/makeopts /tmp/ast22-d/makeopts
+                                                                        # yes / no
+
+# the libdir fix
+grep -E '^libdir' /home/quectel/asterisk-22-configured/makeopts         # /usr/lib/<triplet>
+
+# the install-prefix trap
+cmake -S . -B /tmp/b -DASTERISK_VERSION_NUM=220000 \
+      -DAST_HEADER_DIR=/home/quectel/asterisk-22-configured/include >/dev/null
+cmake --build /tmp/b -j"$(nproc)" >/dev/null
+DESTDIR=/tmp/stage cmake --install /tmp/b --component chan-quectel --prefix=/usr >/dev/null
+find /tmp/stage -type f          # quectel.conf under /usr/local/etc - the failure mode
+```
+
+---
+
 ## Verification
 
 Run in order; each step gates the next.
@@ -791,7 +1456,9 @@ Run in order; each step gates the next.
    ./dotenv.sh .env cmake -P build-chan-quectel.cmake rpi64
    ctest --preset rpi64
    ```
-   All five tests must pass, in particular **`Check AST_BUILDOPT_SUM`** and
+   All four tests must pass — `Check architecture-specific metadata` is gated on
+   `CMAKE_CROSSCOMPILING` (`src/CMakeLists.txt:95`) and does not run natively. In particular
+   **`Check AST_BUILDOPT_SUM`** and
    **`Check library dependencies`** (confirms only `libasound`, `libsqlite3`, `libc`,
    `libgcc_s`, `ld-linux-aarch64.so.1` are `NEEDED`).
 4. **Compiler check (X6):** the build must be warning-free under GCC 14 with `-Wall`. Treat any
@@ -799,15 +1466,19 @@ Run in order; each step gates the next.
    default in GCC 14.
 5. **ELF sanity:** `readelf -hW build/src/chan_quectel.so` reports `Machine: AArch64`,
    `Type: DYN`.
-6. **Checksum agreement with the running daemon** — the check the ctest cannot do:
+6. **Checksum agreement with the running daemon** — the check the ctest cannot do. Note that
+   `core show settings` prints build option *names*, never the md5 (`main/asterisk.c:502-503`),
+   so the daemon's value has to come from its binary or its tree:
    ```sh
-   grep -Eao '[0-9a-f]{32}' build/src/chan_quectel.so
-   asterisk -rx 'core show settings' | grep -i 'build options'
+   grep -Eao '[0-9a-f]{32}' build/src/chan_quectel.so | sort -u
+   grep -Eao '[0-9a-f]{32}' "$(command -v asterisk)" | sort -u | head
    ```
-   Confirm the module's embedded sum corresponds to the daemon's build options.
-7. **Runtime load:**
+   Both must contain the same sum. See **Part E.5** step 12.
+7. **Runtime load** (`install-chan-quectel.cmake` stages into `install/` via `DESTDIR` and
+   dispatches to presets that do not exist — **B5**; use `cmake --install` directly, and see
+   **Part E.5** step 13):
    ```sh
-   sudo cmake -P install-chan-quectel.cmake
+   sudo cmake --install build --component chan-quectel
    asterisk -rx 'module load chan_quectel.so'
    asterisk -rx 'quectel show devices'
    asterisk -rx 'core show taskprocessors like chan-quectel'

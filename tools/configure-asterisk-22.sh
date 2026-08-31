@@ -14,6 +14,15 @@
 #                default: $ASTERISK_22_BUILD, else <src-tree>-configured
 #
 # Environment:
+#   AST_PROFILE=headers|daemon
+#                              headers (default) - the leanest tree that can serve as
+#                              AST_HEADER_DIR; daemon - additionally usable as a PBX,
+#                              with XML documentation and the English core sounds and
+#                              music-on-hold.  Both profiles leave MENUSELECT_CFLAGS at
+#                              exactly OPTIONAL_API, so buildopts.h and AST_BUILDOPT_SUM
+#                              are byte-identical between them.
+#   AST_LIBDIR=<triplet>       Debian multiarch triplet used for --libdir, autodetected;
+#                              set it to an empty string to keep autoconf's /usr/lib
 #   FORCE=1                    reconfigure an existing <dest-tree> (it is removed first)
 #   AST_DOWNLOAD_CACHE=<dir>   passed as --with-download-cache; required for an offline
 #                              configure, since third-party/{pjproject,jansson,libjwt}
@@ -31,7 +40,8 @@
 #   -DAST_HEADER_DIR=<dest-tree>/include
 #
 # To also build and install the daemon from the very same tree - which is what makes the
-# module's and the daemon's AST_BUILDOPT_SUM agree by construction - continue with
+# module's and the daemon's AST_BUILDOPT_SUM agree by construction - use AST_PROFILE=daemon
+# and continue with
 #   cd <dest-tree> && make -j"$(nproc)" && sudo make install
 #
 
@@ -76,6 +86,40 @@ if [ -n "${AST_DOWNLOAD_CACHE}" ]; then
     DOWNLOAD_CACHE_ARG=(--with-download-cache="${AST_DOWNLOAD_CACHE}")
 fi
 
+# Build profile.  Both profiles pass the same menuselect compiler flags, and
+# build_tools/make_buildopts_h hashes nothing but MENUSELECT_CFLAGS, so buildopts.h -
+# and with it AST_BUILDOPT_SUM - is byte-identical whichever profile is used.  Neither
+# --disable-xmldoc, nor the sound packages, nor --libdir, nor the module selection, nor
+# any other ./configure flag enters the checksum.
+AST_PROFILE=${AST_PROFILE:-headers}
+case "${AST_PROFILE}" in
+    headers | daemon) ;;
+    *) die "Unknown AST_PROFILE - ${AST_PROFILE} (expected 'headers' or 'daemon')" ;;
+esac
+
+# Asterisk puts its modules in ${libdir}/asterisk/modules and libdir defaults to
+# /usr/lib, but chan_quectel.so installs to lib/${CMAKE_LIBRARY_ARCHITECTURE}/asterisk/
+# modules - the Debian multiarch path (src/CMakeLists.txt).  Line the two up, or the
+# daemon will never find the module.  Set AST_LIBDIR= (empty) to keep autoconf's default.
+if [ -z "${AST_LIBDIR+x}" ]; then
+    AST_LIBDIR=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null) ||
+        AST_LIBDIR=$("${CC:-gcc}" -print-multiarch 2>/dev/null) ||
+        AST_LIBDIR=
+fi
+LIBDIR_ARG=()
+AST_MODDIR=/usr/lib/asterisk/modules
+if [ -n "${AST_LIBDIR}" ]; then
+    LIBDIR_ARG=(--libdir=/usr/lib/"${AST_LIBDIR}")
+    AST_MODDIR=/usr/lib/${AST_LIBDIR}/asterisk/modules
+fi
+
+# XML documentation is dead weight when all we want is headers, but a daemon without it
+# answers `core show application ...` with nothing.
+XMLDOC_ARG=(--disable-xmldoc)
+if [ "${AST_PROFILE}" = "daemon" ]; then
+    XMLDOC_ARG=()
+fi
+
 # Mandatory-if-requested codec libraries: keep --with- only where pkg-config finds them.
 if [ -n "${AST_CODEC_ARGS+x}" ]; then
     read -r -a CODEC_ARGS <<< "${AST_CODEC_ARGS}"
@@ -97,12 +141,13 @@ fi
 ./configure \
     "${DOWNLOAD_CACHE_ARG[@]}" \
     "${CODEC_ARGS[@]}" \
+    "${LIBDIR_ARG[@]}" \
+    "${XMLDOC_ARG[@]}" \
     --prefix=/usr \
     --sysconfdir=/etc \
     --localstatedir=/var \
     --bindir=/usr/bin \
     --sbindir=/usr/bin \
-    --disable-xmldoc \
     --disable-dev-mode \
     --disable-internal-poll \
     --without-oss \
@@ -155,6 +200,30 @@ make menuselect.makeopts 1>&2
 #    AST_NUM_CHANNEL_BUCKETS / AST_PBX_MAX_STACK on a 64-bit host, and it is excluded
 #    from the checksum by build_tools/make_buildopts_h - so a divergence in it would not
 #    even be caught by the Check AST_BUILDOPT_SUM test.
+#    The sound packages and the file-format modules that read them travel together.
+#    The headers profile wants none of them; the daemon profile wants the English core
+#    sounds and music-on-hold, plus format_gsm, without which the .gsm variants it just
+#    downloaded are unplayable (.wav is format_wav and .g722 is format_pcm, both kept).
+#    EXTRA-SOUNDS-EN-* stays off in both profiles - a large download nothing here uses.
+SOUND_ARGS=()
+if [ "${AST_PROFILE}" = "daemon" ]; then
+    SOUND_ARGS+=(--enable format_gsm)
+else
+    SOUND_ARGS+=(--disable format_gsm)
+fi
+for pkg in CORE-SOUNDS-EN MOH-OPSOUND; do
+    for fmt in WAV GSM G722; do
+        if [ "${AST_PROFILE}" = "daemon" ]; then
+            SOUND_ARGS+=(--enable "${pkg}-${fmt}")
+        else
+            SOUND_ARGS+=(--disable "${pkg}-${fmt}")
+        fi
+    done
+done
+for fmt in WAV GSM G722; do
+    SOUND_ARGS+=(--disable "EXTRA-SOUNDS-EN-${fmt}")
+done
+
 menuselect/menuselect \
     --disable BUILD_NATIVE \
     --disable codec_speex \
@@ -165,7 +234,6 @@ menuselect/menuselect \
     --enable func_speex \
     --disable cdr_sqlite3_custom \
     --disable cel_sqlite3_custom \
-    --disable format_gsm \
     --disable format_wav_gsm \
     --disable format_siren7 \
     --disable format_siren14 \
@@ -201,15 +269,7 @@ menuselect/menuselect \
     --disable astdb2sqlite3 \
     --disable astdb2bdb \
     --disable astcanary \
-    --disable CORE-SOUNDS-EN-WAV \
-    --disable CORE-SOUNDS-EN-GSM \
-    --disable CORE-SOUNDS-EN-G722 \
-    --disable MOH-OPSOUND-WAV \
-    --disable MOH-OPSOUND-GSM \
-    --disable MOH-OPSOUND-G722 \
-    --disable EXTRA-SOUNDS-EN-WAV \
-    --disable EXTRA-SOUNDS-EN-GSM \
-    --disable EXTRA-SOUNDS-EN-G722 \
+    "${SOUND_ARGS[@]}" \
     menuselect.makeopts 1>&2
 
 # 5. Generate the two headers the chan-quectel build needs.
@@ -221,6 +281,10 @@ for h in include/asterisk/autoconfig.h include/asterisk/buildopts.h; do
     [ -r "${h}" ] || die "Expected ${AST_DST}/${h} to exist after configuring"
 done
 echoerr "AST_BUILDOPT_SUM: $(sed -n 's/.*AST_BUILDOPT_SUM[[:space:]]*"\([0-9a-f]*\)".*/\1/p' include/asterisk/buildopts.h)"
-echoerr "Asterisk ${AST_VER} configured in ${AST_DST}"
+echoerr "Asterisk ${AST_VER} configured in ${AST_DST}  (profile: ${AST_PROFILE})"
+echoerr "Module directory: ${AST_MODDIR}"
 echoerr "Use: -DAST_HEADER_DIR=${AST_DST}/include -DASTERISK_VERSION_NUM=220000"
+if [ "${AST_PROFILE}" = "daemon" ]; then
+    echoerr "Then: cd ${AST_DST} && make -j\"\$(nproc)\" && sudo make install && sudo make samples"
+fi
 echo "${AST_DST}/include"
