@@ -1193,9 +1193,11 @@ runuser  = asterisk
 rungroup = asterisk
 ```
 
-and, so that `asterisk -rx` works without `sudo`, in `[files]`:
+and, so that `asterisk -rx` works without `sudo`, in `[files]` — **uncommenting the section
+header itself, not just the keys**:
 
 ```ini
+[files]
 astctlpermissions = 0660
 astctlowner       = asterisk
 astctlgroup       = asterisk
@@ -1207,10 +1209,23 @@ then
 sudo usermod -aG asterisk "$USER"      # takes effect at your next login
 ```
 
-Both stanzas are commented out in the shipped sample (`asterisk.conf.sample:79-80,149-154`), so
-without this the control socket is owned by `asterisk` with no group access and every
-`asterisk -rx` from your login shell fails with `Unable to connect to remote asterisk`. Until you
-log out and back in, prefix the CLI commands below with `sudo`.
+Both stanzas ship commented out: `runuser`/`rungroup` at `asterisk.conf.sample:79-80`, and the
+whole `[files]` block — **header included** — at `:149-154`. That header is the trap. Asterisk
+reads these three keys only through `ast_variable_browse(cfg, "files")` (`main/options.c:249-258`),
+so with `;[files]` left commented the uncommented keys are parsed as part of the preceding
+`[options]` section, where nothing matches them and they are dropped without a warning.
+`ctl_perms`, `ctl_owner` and `ctl_group` then stay empty (`main/options.c:129-148` initialises
+only `.ctl_file`) and `ast_makesocket()` skips both fixups — `chown()` gets `uid = gid = -1` and
+the `chmod()` is guarded by `!ast_strlen_zero()` (`main/asterisk.c:1666-1692`).
+
+`/var/run/asterisk/asterisk.ctl` is then left with whatever mode a bound AF_UNIX socket inherits
+from the daemon's umask — `srwxr-xr-x asterisk:asterisk` under systemd's default `UMask=0022`.
+Group `asterisk` can read it but not write it, and connecting to a unix socket requires **write**
+permission, so every `asterisk -rx` from your login shell fails with `Unable to connect to remote
+asterisk` even when `id` shows you in the group and step 8's ownership is correct. Diagnose with
+`ls -l /var/run/asterisk/asterisk.ctl`: `srw-rw----` is right, `srwxr-xr-x` means the `[files]`
+header is still commented out. Until you log out and back in, prefix the CLI commands below with
+`sudo`.
 
 #### 9. systemd unit
 
