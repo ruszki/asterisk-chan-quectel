@@ -1257,12 +1257,21 @@ systemctl status asterisk --no-pager
 journalctl -u asterisk -b --no-pager | tail -40
 asterisk -rx 'core show settings'  | grep -Ei 'version|build options|module directory|user|group'
 asterisk -rx 'module show like pjsip' | tail -3
-ls -l /var/log/asterisk/full
+ls -l /var/log/asterisk/
+asterisk -rx 'logger show channels'
 ```
 
 Assert: version `22.11.0`, `ABI related Build Options: OPTIONAL_API`, and a module directory of
 `/usr/lib/aarch64-linux-gnu/asterisk/modules`. A `Type=notify` unit that starts and is then killed
 after ~90 s means `HAVE_SYSTEMD` was `0` at step 4 — go back and reconfigure with `FORCE=1`.
+
+The only log file `make samples` leaves enabled is `messages.log`; `app_queue` adds `queue_log` when
+it loads. **There is no `/var/log/asterisk/full`** — the extensionless names are pre-13, and today's
+sample is `;full.log => …`, shipped commented out (`configs/samples/logger.conf.sample:174-177`,
+identical in 20.21.0 and 22.11.0; `contrib/scripts/asterisk.logrotate` rotates `*.log`, `queue_log`
+and `mmlog` only). For the driver debugging in steps 12–14, uncomment that line in
+`/etc/asterisk/logger.conf` and run `asterisk -rx 'logger reload'` — the file appears on reload, not
+at daemon start.
 
 #### 11. Build the driver against that same tree
 
