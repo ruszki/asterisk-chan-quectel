@@ -105,11 +105,15 @@ void pvt_disconnect(struct pvt* pvt)
 {
     if (!PVT_NO_CHANS(pvt)) {
         struct cpvt* cpvt;
-        AST_LIST_TRAVERSE(&(pvt->chans), cpvt, entry) {
+        /* cpvt_change_state() to CALL_STATE_RELEASED frees cpvt and unlinks it from
+         * pvt->chans, so the next pointer must be taken before the body runs */
+        AST_LIST_TRAVERSE_SAFE_BEGIN(&(pvt->chans), cpvt, entry)
+        {
             at_hangup_immediately(cpvt, AST_CAUSE_NORMAL_UNSPECIFIED);
             CPVT_RESET_FLAG(cpvt, CALL_FLAG_NEED_HANGUP);
             cpvt_change_state(cpvt, CALL_STATE_RELEASED, AST_CAUSE_NORMAL_UNSPECIFIED);
         }
+        AST_LIST_TRAVERSE_SAFE_END;
     }
 
     if (pvt->initialized) {
