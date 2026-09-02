@@ -1442,7 +1442,7 @@ surface.
 | `./configure` hangs at third-party | no network for pjproject | `AST_DOWNLOAD_CACHE` with the tarballs staged |
 | step 4 prints `Already configured` and changes nothing | destination exists | re-run with `FORCE=1` |
 | `Git - unable to describe` from CMake | tag missing after clone | `git fetch --tags`, else `cmake -P make-release-tag.cmake` (**B1**) |
-| `[dev][AT+CSCS] ⍻ No UCS-2 encoding support`, device stuck at `Not initialized` | modem rejects `AT+CSCS="UCS2"`; init aborts and the device restarts in a loop | **E.8.2** — probe the port directly with `AT+CMEE=2` before blaming the driver |
+| `[dev][AT+CSCS] ⍻ No UCS-2 encoding support`, device stuck at `Not initialized` | **SIM not seated** — init aborts before it ever reaches `AT+CPIN?`, so it blames the charset | reseat the SIM; confirm with `AT+CPIN?` / `AT+QSIMSTAT?` on the raw TTY (**E.8.2**) |
 | daemon SEGVs on `quectel show device state` | out-of-range enum read — fixed in `src/mutils.h` | **E.8.1**; if it recurs, rebuild, the installed `.so` predates the fix |
 
 Rollback: `sudo systemctl disable --now asterisk`, `sudo rm /etc/systemd/system/asterisk.service`,
@@ -1518,9 +1518,10 @@ find /tmp/stage -type f          # quectel.conf under /usr/local/etc - the failu
 
 ### E.8 — Runtime defects found on the Pi (§E.5 step 14)
 
-Two defects surfaced the first time the module met a real modem — an EC25-EUX on a Raspberry Pi
-running the Asterisk 22.11.0 daemon built by §E.5. They are unrelated to each other and neither is
-an Asterisk-20-vs-22 problem.
+Two issues surfaced the first time the module met a real modem — an EC25-EUX on a Raspberry Pi
+running the Asterisk 22.11.0 daemon built by §E.5. Neither is an Asterisk-20-vs-22 problem. One is
+a genuine driver defect, now fixed (E.8.1); the other turned out to be a badly seated SIM whose
+symptom pointed convincingly at the driver and then at the modem firmware (E.8.2).
 
 #### E.8.1 — `enum2str_def()` reads out of bounds — daemon SEGV (**fixed**)
 
@@ -1577,33 +1578,60 @@ printf '%s\n' 'static const char* const n[] = {"zero","one",""};' \
   'enum2str_def((unsigned)-1, n, 3, "DEF");'
 ```
 
-#### E.8.2 — EC25-EUX rejects `AT+CSCS="UCS2"` — device never initialises (**open**)
+#### E.8.2 — `AT+CSCS="UCS2"` fails when the SIM is not seated (**resolved — hardware**)
 
 ```
 [quectel0][AT+CSCS] ⍻ No UCS-2 encoding support
 [quectel0] Fail to handle response
 ```
 
-`AT+CSCS="UCS2"` is the 4th command of `at_enqueue_initialization()` (`at_command.c:162`). Its
-error case does `goto e_return` (`at_response.c:693-695`), `at_response()` returns −1,
-`response_taskproc()` logs *Fail to handle response*, and the monitor thread tears the device down
-and restarts it. There is no fallback — `README.md` states UCS-2 is mandatory. The device therefore
-sits at `Not initialized` (`connected = 1`, `initialized = 0`, `chan_quectel.c:962-971`) and
-restarts every few seconds, which is what kept re-exposing E.8.1.
+**Root cause: the SIM card was not properly seated in its holder.** Reseating it made
+`AT+CSCS="UCS2"` succeed and initialisation complete. Not a driver defect and not a firmware
+defect — but the symptom pointed at both, so it is recorded here in full.
 
-Reproduced outside Asterisk on the raw TTY, which rules out both `ATZ` side effects and any
-response mis-correlation in the driver:
+Why it looked like a UCS-2 problem. `AT+CSCS="UCS2"` is the 4th command of
+`at_enqueue_initialization()` (`at_command.c:162`). Its error case does `goto e_return`
+(`at_response.c:693-695`), `at_response()` returns −1, `response_taskproc()` logs *Fail to handle
+response*, and the monitor thread tears the device down and restarts it. So the device sat at
+`Not initialized` (`connected = 1`, `initialized = 0`, `chan_quectel.c:962-971`) and restarted every
+few seconds, which is what kept re-exposing E.8.1.
+
+The misdiagnosis was reinforced by two things that both looked like firmware faults:
 
 ```
-AT+CSCS=?        → +CSCS: ("IRA","GSM","UCS2")   OK
-AT+CSCS="UCS2"   → ERROR
+AT+CSCS=?        → +CSCS: ("IRA","GSM","UCS2")   OK      ← charset advertised as supported
+AT+CSCS="UCS2"   → ERROR                                  ← …but every write form rejected
+AT+CSCS=UCS2     → ERROR
+AT+CSCS="GSM"    → ERROR
+AT+CMEE=2        → OK                                     ← and errors stayed bare afterwards
+ATI              → Quectel / EC25 / EC25EUXGAR08A19M1G
+AT+QGMR          → EC25EUXGAR08A19M1G_A0.200.A0.200
 ```
 
-The firmware advertises UCS-2 in the test command and rejects it in the write command. Still to
-determine, with `AT+CMEE=2` set so the modem gives a reason instead of a bare `ERROR` (init sets
-`AT+CMEE=0`, `at_command.c:151`): whether the unquoted `AT+CSCS=UCS2` form is accepted, whether any
-`AT+CSCS=` write works at all, and what `ATI` / `AT+QGMR` report. That decides between a driver-side
-fix at `at_command.c:162` and a modem firmware update.
+A test command that lists a charset the write command then refuses reads as a firmware bug. It is
+not; on this EC25-EUX build the `AT+CSCS=` write fails while the SIM is absent or badly seated.
+
+**Diagnostic lesson: `AT+CPIN?` is the check that would have caught this, and the driver never
+reaches it.** It sits at `at_command.c:177`, eight commands after the CSCS that aborts the chain.
+Anything that kills init before `CMD_AT_CPIN` therefore reports the *symptom* command rather than
+the SIM. When a device is stuck at `Not initialized`, query the SIM on the raw TTY first:
+
+```
+AT+CPIN?     → +CPIN: READY
+AT+QSIMSTAT? → +QSIMSTAT: 0,1     (second field 1 = SIM inserted)
+AT+CCID
+```
+
+Two driver-side observations, both recorded and **not** acted on:
+
+- **The fatal abort is disproportionate.** `from_ucs2()` is called in only three places — SMSC from
+  `+CSCA` (`at_response.c:1334`), network names from `+QSPN` (`:2637,2643`), and USSD text
+  (`:1866,1884`). SMS runs in PDU mode (`AT+CMGF=0`, `at_command.c:161`) and carries its own
+  encoding; voice is unaffected. Losing UCS-2 degrades three display strings, yet
+  `at_response.c:693` refuses to bring the device up at all.
+- **The message misleads.** *"No UCS-2 encoding support"* named the wrong subsystem for a seating
+  fault. Either moving `CMD_AT_CPIN` ahead of `CMD_AT_CSCS`, or having the CSCS error handler
+  mention the SIM, would have cut this diagnosis short.
 
 
 ---
