@@ -1423,10 +1423,249 @@ Optional, for stable names: the IMEI/IMSI udev rules in `tools/udev/` (they need
 
 #### 15. Smoke test
 
-With a modem attached and registered: place and answer a call (exercises `channel_tech` and the
-audio path), send an SMS with `QUECTEL_SEND_SMS`, and confirm an inbound SMS reaches the `sms`
-extension (`pdu.c` → `smsdb.c` → `channel_start_local_json()`). See `README.md` for the dialplan
-surface.
+Steps 0–14 prove the module *builds, loads and talks to the modem*. This step proves the parts a
+user actually touches: a call in each direction with audio, an outgoing SMS, and an incoming SMS.
+
+Nothing here needs a desk phone, a softphone or SIP. Every action is driven from the Asterisk CLI
+on the Pi; the other end of each call and message is **an ordinary mobile phone in your hand**.
+
+What you need before starting:
+
+* the modem's device reaching `Free` in `quectel show devices` (step 14),
+* a second phone with its own number, able to call and text the SIM in the modem,
+* the **phone number of the SIM in the modem** — you will dial it from that phone,
+* enough credit/allowance on both SIMs for one call and two SMS.
+
+If you have not logged out and back in since step 8, prefix every `asterisk -rx …` below with
+`sudo`.
+
+##### 15.1 Open a window you can watch
+
+Asterisk's interesting output is *verbose* output, and none of it reaches `messages.log` by
+default (step 10). Open a **second terminal** on the Pi and leave a live console running in it for
+the whole of this step:
+
+```sh
+sudo asterisk -rvvv
+```
+
+That attaches to the already-running daemon and prints events as they happen. Leave it open; run
+the commands from §15.2 onwards in your first terminal.
+
+* To leave that console, type `exit` (or press `Ctrl-D`). **Do not type `core stop now`** — that
+  shuts the daemon down.
+* It is a full CLI as well: anything shown below as `asterisk -rx '<cmd>'` can equally be typed as
+  just `<cmd>` at its `pi*CLI>` prompt.
+* If you would rather have the same stream in a file, uncomment `full.log` in
+  `/etc/asterisk/logger.conf` and run `asterisk -rx 'logger reload'` (step 10), then
+  `tail -f /var/log/asterisk/full.log`.
+
+Useful while watching:
+
+```sh
+asterisk -rx 'core show channels'            # what is up right now
+asterisk -rx 'quectel show device state quectel0'
+```
+
+Note the command word is `state`, not `status` — `quectel show device state` is what `cli.c:165`
+registers, even though the block it prints is headed `Status` and `README.md` calls it
+`show device status`.
+
+##### 15.2 Teach Asterisk what to do with what arrives
+
+Out of the box Asterisk does **nothing** with an incoming call or message: the driver hands each
+one to the dialplan, and if the dialplan has no matching extension the call is rejected and the
+SMS goes nowhere visible. So the dialplan has to be written before any inbound test can pass. This
+is configuration, not code — nothing here is part of the port.
+
+The driver hands everything to the context named by `context=` in `quectel.conf`, which ships as
+`incoming-mobile` (`quectel.conf:9`), and picks the *extension* inside it like this:
+
+| What arrives | Extension used | Set by |
+| --- | --- | --- |
+| voice call | the SIM's own number if the modem reports one, else the `exten=` setting, else `s` | `at_response.c:908` |
+| SMS | `sms` | `at_response.c:1704` |
+| delivery report for an SMS you sent | `report` | `at_response.c:1455` |
+| USSD reply | `ussd` | `at_response.c:1911` |
+
+Which one an incoming *call* will land on is worth checking first, because it decides whether the
+`s` extension below is ever reached:
+
+```sh
+asterisk -rx 'quectel show device state quectel0' | grep 'Subscriber Number'
+```
+
+`Unknown` means calls arrive at `s`. A number means calls arrive at **that** extension, and you
+must add it (the `Goto` line below) or they will be rejected with `Unable to start pbx`.
+
+Append this to `/etc/asterisk/extensions.conf` (`sudoedit /etc/asterisk/extensions.conf`). It is a
+new context; leave the rest of the file alone:
+
+```ini
+[incoming-mobile]
+; ---- incoming voice call -------------------------------------------------
+exten => s,1,NoOp(Incoming call on ${JSON_DECODE(QUECTEL,name)} from ${CALLERID(num)})
+ same => n,Answer()
+ same => n,Wait(1)
+ same => n,Playback(demo-congrats)
+ same => n,Echo()
+ same => n,Hangup()
+
+; Only needed when 'Subscriber Number' above is NOT Unknown.
+; Replace +36301234567 with exactly the number that command printed.
+exten => +36301234567,1,Goto(s,1)
+
+; ---- incoming SMS --------------------------------------------------------
+exten => sms,1,NoOp(SMS on ${JSON_DECODE(QUECTEL,name)})
+ same => n,Verbose(0,*** SMS from ${CALLERID(num)} at ${JSON_DECODE(SMS,ts)}: ${JSON_DECODE(SMS,msg)})
+ same => n,Hangup()
+
+; ---- delivery report for an SMS we sent ----------------------------------
+exten => report,1,NoOp(Report on ${JSON_DECODE(QUECTEL,name)})
+ same => n,Verbose(0,*** SMS report for ${CALLERID(num)}: success=${JSON_DECODE(REPORT,success)} ${JSON_DECODE(REPORT,subject)}/${JSON_DECODE(REPORT,direction)})
+ same => n,Hangup()
+
+; ---- USSD reply ----------------------------------------------------------
+exten => ussd,1,NoOp(USSD on ${JSON_DECODE(QUECTEL,name)})
+ same => n,Verbose(0,*** USSD [${JSON_DECODE(USSD,type_description)}]: ${JSON_DECODE(USSD,ussd)})
+ same => n,Hangup()
+```
+
+Then load it and check it took:
+
+```sh
+sudo asterisk -rx 'dialplan reload'
+asterisk -rx 'dialplan show incoming-mobile'
+```
+
+Assert: the listing shows the extensions you just added. `Verbose(0,…)` prints at any verbosity, so
+these lines appear in the §15.1 console without further ceremony.
+
+Why these particular applications: `Answer()` is what answering a call *is* at the dialplan level —
+it makes the driver send `ATA` and bring the audio path up. `Playback` proves downlink audio
+(Pi → modem → your ear) and `Echo` proves the uplink (your voice → modem → Pi → back), which is the
+only way to exercise both halves of `channel.c` with a single phone.
+
+##### 15.3 Place an outgoing call
+
+`channel originate` (`res_clioriginate.c:149`) creates a channel and, once the far end answers,
+runs one application on it. That is a complete outgoing-call test with no phone configured in
+Asterisk at all. Substitute the number of the phone in your hand:
+
+```sh
+sudo asterisk -rx 'channel originate Quectel/quectel0/+36301234567 application Playback demo-congrats'
+```
+
+The dial string is `Quectel/<device>/<number>`; `<device>` may also be `g0` (any free device in
+group 0), `r0` (round-robin within the group), or `j:<ICCID>`. Only `0123456789*#+ABC` are accepted
+in the number (`channel.c:96`).
+
+Expected: your phone rings, the caller ID is the modem's SIM, and on answering you hear the
+"congratulations" prompt, then the call clears. In the §15.1 console you see the channel being
+created, `AT+CHUP`/`AT+QHUP` traffic and the hangup.
+
+Assert: the call connects **and there is audio**. A call that rings but is silent means the audio
+path, not the port — check `uac=`/`audio=` in `quectel.conf` against how the modem enumerates.
+
+##### 15.4 Answer an incoming call
+
+Dial the modem's SIM from your phone.
+
+Expected, in order, in the §15.1 console: a `ccinfo`/`^DSCI`/`+CLCC` notification, a new
+`Quectel/quectel0-…` channel, `Executing [s@incoming-mobile:1]`, the `Answer`, then `Playback` and
+`Echo`. On your phone: the call is answered after about a second, you hear the prompt, and after it
+you hear your own voice echoed back. Hang up from the phone; the console shows the channel being
+destroyed.
+
+Assert: answered, prompt audible (downlink), echo audible (uplink), clean hangup.
+
+If the phone rings but Asterisk logs `Unable to start pbx on incoming call`, the extension does not
+exist — re-read §15.2's table, and check the `Subscriber Number` line again.
+
+##### 15.5 Send an SMS
+
+Simplest form, straight from the CLI (`cli.c:420`):
+
+```sh
+sudo asterisk -rx 'quectel sms send quectel0 +36301234567 Hello from chan_quectel on Asterisk 22'
+```
+
+Everything after the number is the message text, spaces and all. This form always asks for a
+delivery report (`DEF_REPORT = 1`) with a 15-minute validity, so the `report` extension from §15.2
+fires a few seconds later — that is the second half of the test, and it exercises
+`smsdb_outgoing_*` and `channel_start_local_report()`.
+
+Expected: `[quectel0] SMS queued for send`, the message on your phone, then
+`*** SMS report for … success=1` in the console.
+
+The dialplan application does the same thing with explicit validity and report arguments, and is
+what a real installation would use (`resource, number, message, validity_minutes, report`):
+
+```ini
+same => n,QUECTEL_SEND_SMS(quectel0,+36301234567,Hello from the dialplan,60,yes)
+```
+
+as does the standard `MessageSend` with the `mobile` technology, if you prefer Asterisk's generic
+messaging surface:
+
+```ini
+same => n,Set(MESSAGE(body)=Hello from MessageSend)
+same => n,Set(MESSAGE(to)=+36301234567)
+same => n,MessageSend(mobile:quectel0)
+```
+
+To send a message longer than 160 characters, just do it: `pdu_build_mult()` splits it and the far
+phone reassembles it. That is worth doing once, because multipart is where the PDU code earns its
+keep.
+
+##### 15.6 Confirm an inbound SMS
+
+Text the modem's SIM from your phone. Nothing else is required — `msg_direct`/`msg_storage` are
+left at their defaults and the driver handles either delivery style.
+
+Three independent confirmations, in increasing order of "it really went all the way through":
+
+1. **The modem got it** — `asterisk -rx 'quectel sms list all quectel0'` lists it. Note that
+   `autodeletesms=yes` in the shipped config deletes a message once it is fully received, so this
+   list is usually empty by the time you look. That is not a failure; go by 2 and 3.
+2. **The driver decoded it** — the §15.1 console shows
+   `[quectel0][SMS:… TS:…] Got message from +36…: [your text]` from `at_response.c:1695`. This is
+   the line that proves `pdu.c` → `char_conv.c` → `smsdb.c` worked.
+3. **The dialplan received it** — `Executing [sms@incoming-mobile:1]` followed by the
+   `*** SMS from …` line, which is `channel_start_local_json()` doing its job. If you enabled
+   `full.log` in §15.1 you can check after the fact instead of watching live:
+   `grep -a 'SMS from' /var/log/asterisk/full.log`.
+
+Assert: all three (allowing for `autodeletesms` on 1), with the text intact.
+
+Send a second one containing non-ASCII characters (accents, or any non-Latin script) and one longer
+than 160 characters. Those two go down different paths — UCS-2 decoding and multipart reassembly —
+and are the ones most likely to show a defect.
+
+##### 15.7 Optional — USSD
+
+A balance enquiry is a one-line end-to-end test of the USSD path, if your operator offers one
+(`*101#`, `*100#` — ask your operator):
+
+```sh
+sudo asterisk -rx 'quectel ussd quectel0 *101#'
+```
+
+Expected: `*** USSD [...]: …` in the console a few seconds later, via the `ussd` extension.
+
+##### 15.8 What this step has proven
+
+| Exercised | By |
+| --- | --- |
+| `channel_tech.requester` / `.call` / `.hangup`, outgoing call setup | 15.3 |
+| `start_pbx()`, `channel_tech.answer`, `.read`/`.write`, both audio directions | 15.4 |
+| `at_enqueue_sms()`, `pdu_build_mult()`, `smsdb_outgoing_*`, `channel_start_local_report()` | 15.5 |
+| `+CMT`/`+CMTI` handling, `pdu.c` TPDU parse, `char_conv.c`, `smsdb.c` reassembly, `channel_start_local_json()` | 15.6 |
+| `at_response_cusd()`, USSD decoding | 15.7 |
+
+Record anything that misbehaves in §E.8 with the same structure as the two entries already there —
+symptom, cause, whether it is an Asterisk-20-vs-22 problem, and the fix. Two of the defects found
+so far were found exactly here, and neither turned out to be a porting problem.
 
 #### 16. If something goes wrong
 
