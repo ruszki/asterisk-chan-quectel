@@ -1382,12 +1382,34 @@ A mismatch of the kind step 12 guards against surfaces right here, as Asterisk r
 (`quectel.conf:44-46`), so the module loads but the device stays down if your enumeration differs.
 
 ```sh
-ls -l /dev/serial/by-id/
-dmesg | grep -i ttyUSB | tail
+lsusb                                       # is the modem on the bus at all?
+ls -l /dev/ttyUSB* /dev/ttyACM* 2>&1        # did a serial driver bind?
+dmesg | grep -iE 'option|qcserial|cdc_acm|ttyUSB|ttyACM' | tail -20
 sudoedit /etc/asterisk/quectel.conf
 sudo asterisk -rx 'quectel reload now'
 asterisk -rx 'quectel show devices'         # the device should reach Free
 ```
+
+`/dev/serial/by-id/` is **not** a directory you can count on. udev creates it lazily — it exists
+only once something has put a symlink in it, and systemd's `60-serial.rules` adds the `by-id` link
+only when `ID_SERIAL` is non-empty. Modems whose firmware ships an empty USB iSerial string get a
+`/dev/serial/by-path/` link and no `by-id` one, so `ls -l /dev/serial/by-id/` answers `No such file
+or directory` on a perfectly healthy setup. Read it as a diagnostic, not a step:
+
+| `lsusb` | `/dev/ttyUSB*` | `/dev/serial/by-id/` | Meaning |
+| --- | --- | --- | --- |
+| no modem | — | — | hardware, power, or USB composite mode — nothing to configure yet |
+| modem | none | — | no `option`/`qcserial`/`cdc_acm` bind; check `dmesg` and ModemManager below |
+| modem | present | missing | normal; the modem reports no iSerial — use `by-path` or `tools/udev/` |
+| modem | present | present | stable names available |
+
+```sh
+ls -l /dev/serial/by-path/                  # exists whenever ID_PATH does
+udevadm info -q property -n /dev/ttyUSB2 | grep -E 'ID_SERIAL|ID_PATH|ID_VENDOR'
+```
+
+The plain `/dev/ttyUSBn` paths in `quectel.conf` work regardless; they are just not stable across
+reboots or re-plugs.
 
 **Disable ModemManager first** — it opens `/dev/ttyUSB*` on hotplug and will lose the race against
 `TIOCEXCL` + `flock`:
@@ -1416,9 +1438,12 @@ surface.
 | service starts, is killed ~90 s later | `Type=notify` without libsystemd | `HAVE_SYSTEMD` was `0` in `makeopts`; install `libsystemd-dev`, redo step 4 with `FORCE=1`, rebuild |
 | `Unable to connect to remote asterisk` from `asterisk -rx` | control-socket permissions | step 8's `[files]` stanza, then log out and back in; `sudo` meanwhile |
 | `Permission denied` on `/dev/ttyUSB*` | `asterisk` not in `dialout`, or ModemManager holds the port | step 6 and step 14 |
+| `/dev/serial/by-id/`: *No such file or directory* | udev made no `by-id` link — usually no modem enumerated, no serial driver bound, or an empty USB iSerial | step 14's table; `by-id` is optional, `/dev/ttyUSBn` still works |
 | `./configure` hangs at third-party | no network for pjproject | `AST_DOWNLOAD_CACHE` with the tarballs staged |
 | step 4 prints `Already configured` and changes nothing | destination exists | re-run with `FORCE=1` |
 | `Git - unable to describe` from CMake | tag missing after clone | `git fetch --tags`, else `cmake -P make-release-tag.cmake` (**B1**) |
+| `[dev][AT+CSCS] ⍻ No UCS-2 encoding support`, device stuck at `Not initialized` | modem rejects `AT+CSCS="UCS2"`; init aborts and the device restarts in a loop | **E.8.2** — probe the port directly with `AT+CMEE=2` before blaming the driver |
+| daemon SEGVs on `quectel show device state` | out-of-range enum read — fixed in `src/mutils.h` | **E.8.1**; if it recurs, rebuild, the installed `.so` predates the fix |
 
 Rollback: `sudo systemctl disable --now asterisk`, `sudo rm /etc/systemd/system/asterisk.service`,
 `cd ~/src/asterisk-22-configured && sudo make uninstall`. `make uninstall-all` additionally
@@ -1454,8 +1479,9 @@ Two corrections to earlier text, both made:
   prints build option *names* (`main/asterisk.c:502-503`), never the md5. §E.5 step 12 has the
   working comparison.
 
-`src/` is still untouched on this branch, and there is still no `#if ASTERISK_VERSION_NUM` guard
-anywhere.
+`src/` now carries two changes on this branch — the `ast_config.h` include-order fix in
+`dc_config.c` and the `enum2str_def()` crash fix in `mutils.h` (**E.8**) — and there is still no
+`#if ASTERISK_VERSION_NUM` guard anywhere.
 
 ### E.7 — How to re-check this chapter
 
@@ -1488,6 +1514,97 @@ cmake --build /tmp/b -j"$(nproc)" >/dev/null
 DESTDIR=/tmp/stage cmake --install /tmp/b --component chan-quectel --prefix=/usr >/dev/null
 find /tmp/stage -type f          # quectel.conf under /usr/local/etc - the failure mode
 ```
+
+
+### E.8 — Runtime defects found on the Pi (§E.5 step 14)
+
+Two defects surfaced the first time the module met a real modem — an EC25-EUX on a Raspberry Pi
+running the Asterisk 22.11.0 daemon built by §E.5. They are unrelated to each other and neither is
+an Asterisk-20-vs-22 problem.
+
+#### E.8.1 — `enum2str_def()` reads out of bounds — daemon SEGV (**fixed**)
+
+`quectel show device state <dev>` crashed the whole daemon whenever the device had never
+registered on the network:
+
+```
+#0  enum2str_def (value=4294967295, names=<gsm_states>, items=9, def="Unknown") at src/mutils.h:22
+#1  gsm_regstate2str (gsm_reg_status=-1) at src/helpers.c:645
+#2  cli_show_device_state at src/cli.c:202
+#3  ast_cli_command_full at cli.c:3136
+```
+
+Cause: `S_COR(a, b, c)` **does not short-circuit**. It expands to
+
+```c
+#define S_COR(a, b, c) ({typeof(&((b)[0])) __x = (b); (a) && !ast_strlen_zero(__x) ? (__x) : (c);})
+```
+
+(`include/asterisk/strings.h:87`), so `__x = (b)` is evaluated before `a` is ever tested. The old
+body was `return S_COR(value < items, names[value], def);`, which therefore read `names[value]`
+unconditionally. `gsm_regstate2str()` declares `int` but the parameter is `unsigned`, so
+`pvt->gsm_reg_status = -1` (`chan_quectel.c:155`, and again at `:1132`) arrives as `4294967295` and
+the read lands ~34 GB past the array.
+
+**Not a version problem.** `strings.h` is byte-identical between 20.21.0 and 22.11.0 (Part A.1), so
+this crashes identically on Asterisk 20. It is a latent bug in the driver that only fires when a
+caller passes an out-of-range value, and `gsm_reg_status` is the only initialiser in `src/` that
+does — `pvt->act` starts at `0` (`chan_quectel.c:157`), inside `sys_act2str()`'s range.
+
+Fixed in `src/mutils.h` by bounds-checking before indexing; `S_OR` preserves the previous
+empty-string-falls-back-to-default behaviour:
+
+```c
+if (value >= items) {
+    return def;
+}
+return S_OR(names[value], def);
+```
+
+One fix covers every caller — `enum2str()` delegates here, as do `gsm_regstate2str()`,
+`gsm_regstate2str_json()`, `sys_act2str()` and the rest of `helpers.c`.
+
+The other seven `S_COR` sites in `src/` were checked and are safe: only `cli.c:142` has a
+non-trivial second argument, `ast_describe_caller_presentation()`, and that is a linear search over
+`pres_types[]` returning `"unknown"` for any unmatched value, negatives included — an unnecessary
+call, not a crash.
+
+Reproduced and verified on the dev box, no modem needed:
+
+```sh
+# old body → SIGSEGV; new body → "DEF"
+printf '%s\n' 'static const char* const n[] = {"zero","one",""};' \
+  'enum2str_def((unsigned)-1, n, 3, "DEF");'
+```
+
+#### E.8.2 — EC25-EUX rejects `AT+CSCS="UCS2"` — device never initialises (**open**)
+
+```
+[quectel0][AT+CSCS] ⍻ No UCS-2 encoding support
+[quectel0] Fail to handle response
+```
+
+`AT+CSCS="UCS2"` is the 4th command of `at_enqueue_initialization()` (`at_command.c:162`). Its
+error case does `goto e_return` (`at_response.c:693-695`), `at_response()` returns −1,
+`response_taskproc()` logs *Fail to handle response*, and the monitor thread tears the device down
+and restarts it. There is no fallback — `README.md` states UCS-2 is mandatory. The device therefore
+sits at `Not initialized` (`connected = 1`, `initialized = 0`, `chan_quectel.c:962-971`) and
+restarts every few seconds, which is what kept re-exposing E.8.1.
+
+Reproduced outside Asterisk on the raw TTY, which rules out both `ATZ` side effects and any
+response mis-correlation in the driver:
+
+```
+AT+CSCS=?        → +CSCS: ("IRA","GSM","UCS2")   OK
+AT+CSCS="UCS2"   → ERROR
+```
+
+The firmware advertises UCS-2 in the test command and rejects it in the write command. Still to
+determine, with `AT+CMEE=2` set so the modem gives a reason instead of a bare `ERROR` (init sets
+`AT+CMEE=0`, `at_command.c:151`): whether the unquoted `AT+CSCS=UCS2` form is accepted, whether any
+`AT+CSCS=` write works at all, and what `ATI` / `AT+QGMR` report. That decides between a driver-side
+fix at `at_command.c:162` and a modem firmware update.
+
 
 ---
 
